@@ -23,11 +23,15 @@ pub trait NameResolver {
 }
 
 /// The mutating view a decode path is given: intern a [`Name`] to an
-/// [`Identifier`], allocating into the continuous identifier space when the name
-/// is new. Threaded down the decode call tree, never held by a node.
+/// [`Identifier`], allocating in that component's owned home namespace when the
+/// name is new. Complete borrowed namespace slices remain read-only. Threaded down
+/// the decode call tree, never held by a node.
 pub trait NameInterner {
     /// The identifier for `name`, interning it if it has not been seen. Interning
-    /// is deterministic: the same name always yields the same identifier within
-    /// one table lineage.
-    fn intern(&mut self, name: Name) -> Identifier;
+    /// is deterministic within the table's composed namespace slices: an existing
+    /// name retains its identifier, and a new name receives the next local in the
+    /// component-owned home namespace. Composition does not copy, flatten, or
+    /// renumber slices. Allocation is typed-fallible: a shared home slice cannot be
+    /// mutated after composition or cloning, and namespace capacity is bounded.
+    fn intern(&mut self, name: Name) -> Result<Identifier, NameTableError>;
 }

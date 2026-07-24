@@ -16,11 +16,7 @@ use crate::name::Name;
 use crate::table::NameTable;
 
 /// A speculative interning overlay on a [`NameTable`]. Reads fall through to the
-/// committed table; new names stage above it at the identifiers they would occupy
-/// after a commit. The committed table is untouched until [`commit`] consumes the
-/// transaction; dropping it instead is an implicit, effect-free rollback.
-///
-/// [`commit`]: NameTransaction::commit
+/// complete composed table; new names stage only in its owned home namespace.
 pub struct NameTransaction<'table> {
     base: &'table mut NameTable,
     staged_names: Vec<Name>,
@@ -38,39 +34,40 @@ impl<'table> NameTransaction<'table> {
         }
     }
 
-    /// The first identifier a staged name would occupy — the committed table's
-    /// current length. Stable for the transaction's life, since the committed
-    /// table is borrowed exclusively and never mutated before commit.
+    /// The first local a staged name would occupy in the home namespace.
     fn base_length(&self) -> usize {
         self.base.len()
     }
 
-    /// Intern a name in the overlay. A name already committed resolves to its
-    /// committed identifier (no staging); a name already staged resolves to its
-    /// staged identifier; a genuinely new name stages at the next index above the
-    /// committed table.
-    pub fn intern(&mut self, name: Name) -> Identifier {
+    /// Intern a name in the overlay. A name already present in the home or any
+    /// borrowed slice resolves to its existing identifier; a new spelling stages
+    /// in the home namespace without allocating into a borrowed source.
+    pub fn intern(&mut self, name: Name) -> Result<Identifier, NameTableError> {
         if let Some(identifier) = self.base.lookup(&name) {
-            return identifier;
+            return Ok(identifier);
         }
         if let Some(&identifier) = self.staged_index.get(&name) {
-            return identifier;
+            return Ok(identifier);
         }
-        let identifier = Identifier::new((self.base_length() + self.staged_names.len()) as u32);
+        let local = u16::try_from(self.base_length() + self.staged_names.len())
+            .map_err(|_| NameTableError::NamespaceCapacity(self.base.namespace()))?;
+        let identifier = self.base.namespace().identifier(local);
         self.staged_names.push(name.clone());
         self.staged_index.insert(name, identifier);
-        identifier
+        Ok(identifier)
     }
 
-    /// Resolve an identifier against the overlay: committed identifiers resolve
-    /// through the committed table, staged identifiers through the staging buffer.
+    /// Resolve an identifier against the overlay: borrowed and committed
+    /// identifiers resolve through the composed base; staged home identifiers
+    /// resolve through the staging buffer.
     pub fn resolve(&self, identifier: Identifier) -> Result<&Name, NameTableError> {
-        let base_length = self.base_length();
-        if identifier.position() < base_length {
+        if identifier.namespace() != self.base.namespace()
+            || usize::from(identifier.local()) < self.base_length()
+        {
             return self.base.resolve(identifier);
         }
         self.staged_names
-            .get(identifier.position() - base_length)
+            .get(usize::from(identifier.local()) - self.base_length())
             .ok_or(NameTableError::UnknownIdentifier(identifier))
     }
 
@@ -80,17 +77,16 @@ impl<'table> NameTransaction<'table> {
     }
 
     /// Merge the staged names into the committed table, keeping their staged
-    /// identifiers. This is the only path that mutates the committed table.
-    pub fn commit(self) {
+    /// namespace-local identifiers. This is the only path that mutates the home
+    /// slice.
+    pub fn commit(self) -> Result<(), NameTableError> {
         let Self {
             base, staged_names, ..
         } = self;
-        base.commit_staged(staged_names);
+        base.commit_staged(staged_names)
     }
 
-    /// Discard the staged names, leaving the committed table untouched. Identical
-    /// in effect to dropping the transaction; named for call sites that want the
-    /// rollback to read explicitly.
+    /// Discard the staged names, leaving the composed table untouched.
     pub fn rollback(self) {}
 }
 
@@ -101,7 +97,7 @@ impl NameResolver for NameTransaction<'_> {
 }
 
 impl NameInterner for NameTransaction<'_> {
-    fn intern(&mut self, name: Name) -> Identifier {
+    fn intern(&mut self, name: Name) -> Result<Identifier, NameTableError> {
         NameTransaction::intern(self, name)
     }
 }

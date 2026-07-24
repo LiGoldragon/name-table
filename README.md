@@ -1,8 +1,3 @@
-> **DEPRECATED.** This crate is consolidated into
-> [LiGoldragon/protos](https://github.com/LiGoldragon/protos) as a member of the
-> protos cargo workspace. Every consumer now pins protos. This repository is kept
-> only for history; do not add new pins to it.
-
 # name-table
 
 The stringless-Core identifier space: `Identifier` indices, the interning
@@ -25,16 +20,20 @@ identifiers has no name in its bytes, so:
   over a `Core` value's stringless bytes) never folds a name. A rename is a
   `NameTable`-only edit that changes how identifiers resolve, and can never move
   `Core` identity. Names and `Core` values are structurally incapable of sharing a
-  serialization pre-image — a table's canonical bytes are its ordered names and
-  nothing else.
+  serialization pre-image — a table's archive wire bytes are an explicitly
+  versioned envelope containing its owned `NameSlice`: the namespace and ordered
+  canonical names. The lookup index and borrowed slices are excluded from that
+  archive.
 
 ## What it carries
 
-- `Identifier` — the `u32` index a `Core` value holds in place of a string.
-- `NameTable` — an interned, append-only, index-stable identifier space:
-  `intern`, `resolve`, and `extend_from`. `extend_from` is the one continuous
-  identifier space that carries schema's allocation into logos: the extension
-  begins with every base name at its exact identifier, and new names append above.
+- `Identifier` — a closed namespace variant with a namespace-local `u16` index;
+  a `Core` value holds it in place of a string.
+- `NameTable` — an interned, composable identifier space with exactly one owned
+  home slice. `intern` allocates only in that home namespace; `compose` borrows
+  another completed slice without copying names, flattening state, or renumbering
+  identifiers. An owned slice archives independently and is composed again by its
+  consumer after loading.
 - `NameTransaction` — a speculative interning overlay that merges on commit. A
   failed decode alternative leaves no allocation effect, because the committed
   table is never mutated until commit — a dropped transaction is an effect-free
@@ -73,8 +72,7 @@ cargo test           # inner-loop tests
 
 ## Status
 
-Version 0.1.0. This is slice one, crate L2 of the accepted language-family
-design. It depends on `content-identity` (crate L1) pinned by git revision for
-the shared `PortableArchive` bound. Consumption and integration — schema, nomos,
-logos, and the other consumers adopting these types — will readapt to the
-forthcoming release-train flow.
+Version 0.1.0. This is crate L2 of the accepted language-family design. The
+canonical micro-repository pins the published `content-identity` producer for
+the shared `PortableArchive` and typed hash machinery. Consumers adopt published
+micro-repository revisions producer-first.

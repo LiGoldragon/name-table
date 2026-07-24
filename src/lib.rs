@@ -2,18 +2,19 @@
 //!
 //! This is crate L2 of the shared-codec language family: `content-identity <-
 //! name-table <- raw-discovery <- structural-codec`. Every `Core*` type in the
-//! family is stringless — it carries [`Identifier`] indices, never names — and
+//! family is stringless — it carries [`Identifier`] values, never names — and
 //! all names live here, in a [`NameTable`]. That is the substrate on which the
 //! family's identity ruling stands: because a `Core` value holds no names, a
 //! rename is a table-only edit that can never move `Core` content identity.
 //!
 //! ## What this crate owns
 //!
-//! - [`Identifier`] — the `u32` index a `Core` value carries in place of a string.
-//! - [`NameTable`] — the interned, append-only, index-stable identifier space,
-//!   with [`intern`](NameTable::intern), [`resolve`](NameTable::resolve), and
-//!   [`extend_from`](NameTable::extend_from) for the one continuous schema-into-
-//!   logos identifier space.
+//! - [`Identifier`] — a closed namespace enum whose variants carry `u16` local
+//!   allocations, so identity is never flat-integer arithmetic.
+//! - [`NameTable`] — one component's composed view: a component-owned home
+//!   namespace plus complete borrowed read-only namespace slices, with
+//!   [`intern`](NameTable::intern) and [`resolve`](NameTable::resolve). Composition
+//!   preserves slices without copying, flattening, or renumbering identifiers.
 //! - [`NameTransaction`] — a speculative interning overlay that merges on commit,
 //!   so a failed decode alternative leaves no allocation effect (the accepted
 //!   transactional-interning hardening).
@@ -29,9 +30,10 @@
 //!
 //! ## Names never serialize with Core values
 //!
-//! A table's canonical, archivable state is its ordered name vector alone; the
-//! lookup accelerator is derived and never serialized. Content identity for a
-//! `Core` value comes from `content-identity` over that value's stringless bytes,
+//! A table archives only its owned namespace slice and ordered canonical names;
+//! borrowed slices remain independently archived. The lookup accelerator is
+//! derived and never serialized. Content identity for a `Core` value comes from
+//! `content-identity` over that value's stringless bytes,
 //! which contain no names. So names and `Core` values are structurally incapable
 //! of sharing a pre-image.
 
@@ -45,8 +47,8 @@ mod transaction;
 
 pub use boundary::{NameInterner, NameResolver};
 pub use error::NameTableError;
-pub use identifier::Identifier;
+pub use identifier::{Identifier, IdentifierNamespace};
 pub use name::Name;
 pub use projection::TextualProjection;
-pub use table::{NameTable, NameTableDomain};
+pub use table::{NameTable, NameTableDomain, NameTableSliceSnapshot};
 pub use transaction::NameTransaction;

@@ -1,145 +1,149 @@
 # name-table architecture
 
-## Overview
+## Status boundary
 
-`name-table` is crate L2 of the shared-codec language family. The family's rule
-is that dependencies run strictly downward and stringless Core never depends on
-text: `content-identity <- name-table <- raw-discovery <- structural-codec`. This
-crate holds the identifier space every `Core*` type indexes into, and depends
-only on `content-identity` (for the shared `PortableArchive` rkyv discipline) and
-`rkyv`.
+`name-table` is the string/encodedID correspondence library in the shared
+language substrate. Its current published implementation and its approved
+replacement model are different. This document names both so current APIs are
+not mistaken for the design being built.
 
-## Direction
+The current implementation is a legacy flat model:
 
-The psyche's settled rulings this crate embodies:
+- `IdentifierNamespace` is a closed enum whose variants carry local `u16`
+  indices.
+- One `NameTable` owns one flat `NameSlice` and may borrow completed slices from
+  other component namespaces.
+- `Identifier` values are a namespace variant plus one local index, not a
+  module chain.
+- `NameInterner` permits allocation along codec paths.
+- Composition creates one cross-slice spelling index and can fail with
+  `NameIndexCollision`.
+- `Name` contains eager casing and derived-name walkers.
 
-- All `Core*` types are stringless; every identifier is an index into the
-  corresponding `NameTable`, and all names live here.
-- Each component owns one namespace-local identifier slice; a consumer composes
-  completed source slices by borrowing them, never by copying, flattening, or
-  renumbering their names.
-- The `NameTable` is excluded from `Core` content hashes by construction —
-  renaming is a `NameTable`-only edit and never moves `Core` identity. Names and
-  `Core` values never serialize together.
-- Capitalization is semantic: capitalized-leading is an object, lowercase-leading
-  is a name; the derived-name rule (field name = `snake_case` of type name) lives
-  here as methods on `Name` — one home for the walkers duplicated in `schema` and
-  `schema-rust`.
-- Interning is transactional: a failed decode alternative leaves no allocation
-  effect. A real staging surface provides this, not a convention.
-- Named views (`Textual*`) are derived from `Core` + `NameTable`, never stored.
-- A `NameTable` may later be stored as a first-class co-versioned sibling of
-  `Core` in daemon stores, so it must be cleanly archivable; where it is stored is
-  not this crate's business.
+Those facts describe the code that is wired today. They are not the target
+identity model. Consumers remain pinned to this legacy API until a coordinated
+breaking train replaces it.
 
-Consumption and integration will readapt to the forthcoming release-train flow.
-This crate migrates no consumer; schema, nomos, logos, and the rest adopt these
-types in later train slices.
+## Approved target
 
-## Components and boundaries
+The replacement is generic over a root-table variant type whose production
+variants remain a separate design question. Under one variant, every module
+owns the exact spelling table of its immediate members. A module is itself an
+entry in its containing module's table.
 
-- `Identifier` (`src/identifier.rs`) — a closed rkyv-archivable namespace enum;
-  every variant carries its own local `u16`, and a `Core` value carries it in
-  place of a string.
-- `Name` (`src/name.rs`) — the interned name and the one home of the derived-name
-  rule. The two source walkers (`schema`'s `field_name`, `schema-rust`'s
-  `screaming`) are the same word-boundary walk under two casings; `DerivedCasing`
-  names that difference as data so the loop is written once. `pascal_case` is the
-  inverse round-trip partner.
-- `NameTable` (`src/table.rs`) — the interned, composable identifier space. It
-  owns one mutable home `NameSlice` and borrows completed source slices through
-  shared handles; borrowed names are never copied or archived into the home.
-  The home slice's canonical archive is an explicitly versioned envelope
-  containing its owned `NameSlice`: the namespace and ordered canonical names.
-  Borrowed slices are excluded. The name-to-identifier lookup is a derived
-  accelerator, rebuilt with typed validation on load. `NameTableDomain` gives
-  each owned slice its own content identity for co-versioned sibling storage.
-- `NameTransaction` (`src/transaction.rs`) — the speculative interning overlay.
-- `NameResolver` / `NameInterner` (`src/boundary.rs`) — the two codec-boundary
-  capabilities, threaded down a codec call tree, never held by a node.
-- `TextualProjection` (`src/projection.rs`) — the derive-a-named-view surface.
-- `NameTableError` (`src/error.rs`) — the typed crate-boundary error (thiserror).
+```text
+root table
+  1 <-> "billing"
+  2 <-> "tasks"
 
-## Names never serialize with Core values
+table owned by root/1       table owned by root/2
+  1 <-> "Status"              1 <-> "Status"
+```
 
-This is structural, not a runtime check. A `Core` value is built from
-`Identifier` indices and holds no names, so no name can enter its content-hash
-pre-image (`content-identity` hashes the stringless bytes). A `NameTable`'s
-archive wire bytes are an explicitly versioned envelope containing its owned
-`NameSlice`: the namespace and ordered canonical names. Its lookup index is
-derived and never archived, and borrowed slices remain excluded. The archive
-version is separate from `NameTableDomain`'s hash-domain layout version, which
-separates content identities rather than selecting an archive decoder. The two
-data shapes have disjoint pre-images, so a rename — a table-only edit — cannot
-move any `Core` address. The `archive` and `transaction` test suites prove the
-byte-level and identity-level stability.
+The two `Status` declarations do not collide. Their durable identities are the
+complete encodedID chains `root/1/1` and `root/2/1`. Encoded forms carry those
+integer chains, never spellings and never a separate declared-thing identity.
 
-## The transactional contract
+The root variant identifies the root table. It does not license this library to
+invent the production variant set or attach semantics to it.
 
-The accepted hardening requires that a failed decode alternative leave no
-allocation effect. `name-table` meets it structurally rather than by undo: a
-`NameTransaction` stages new names on the side and never mutates the committed
-table until `commit`. A dropped or rolled-back transaction therefore leaves the
-table byte-identical by construction — there is nothing to undo. A decode runs
-each alternative inside a transaction (`begin`, or the `try_intern` closure form)
-and commits only the winner; the loser is dropped and leaks nothing.
+## Table state
 
-## The one home for the walkers
+Each module table has a top-level head containing:
 
-The derived-name rule was hand-written independently as `schema`'s
-`Name::field_name` (PascalCase to `snake_case`, 16 call sites) and `schema-rust`'s
-`ScreamingName::screaming` (PascalCase to `SCREAMING_SNAKE`). Both are the same
-word-boundary walk. Here they are one private walk (`Name::derived_name`)
-parameterized by a `DerivedCasing`, with `field_name` and `screaming` as the two
-public spellings and `pascal_case` as the inverse. schema's walker first strips a
-namespace through its own `local_part()`; that namespace split is a schema concern
-and is deliberately excluded here — on a bare name the behaviors are identical,
-which the `walkers` tests assert against the exact ported expectations.
+- its structural address: root variant plus the owning-module encodedID chain;
+- `Mutable` or `Immutable`;
+- its current generation;
+- its next never-reused local `u16`, represented explicitly as available or
+  exhausted;
+- its current immutable snapshot locator.
 
-## Constraints
+An immutable snapshot records that table's ordered
+`local encodedID <-> exact spelling` correspondence and integrity metadata.
+The reverse spelling index is derived and scoped to that table only. Tables are
+exact and case-sensitive: `"public"` and `"Public"` are different entries.
+They perform no casing, normalization, derivation, or semantic interpretation.
 
-- Every function is a method on a data-bearing type or a trait impl; no free
-  helpers outside test code.
-- Domain values are typed newtypes; the one casing axis is a `DerivedCasing` enum,
-  not a boolean.
-- Typed errors at the boundary; no `anyhow`/`eyre`.
-- No unsafe code (`unsafe_code = "forbid"`).
-- A `NameTable`'s archive wire bytes are an explicitly versioned envelope over
-  its owned `NameSlice` (namespace and ordered canonical names); borrowed slices
-  and the lookup index are never serialized.
+Snapshot hashes are integrity and caching data. This model neither establishes
+nor forecloses recursive content hashing of individual things.
 
-## Invariants
+Child-table ownership is structural. A table at an entry's full encodedID chain
+is the table owned by that module; membership is not an attribute on a flat
+global row.
 
-- Interning is deterministic: a canonical name interns to the same identifier
-  every time within one composed table.
-- Identifiers are namespace-local and index-stable: a completed slice retains
-  each exact variant and local index when another table borrows it.
-- A rolled-back or dropped transaction leaves the table byte-identical, down to
-  `to_archive_bytes` and `identity` (proven in `tests/transaction.rs`).
-- `field_name`/`screaming` reproduce the two source walkers exactly (proven in
-  `tests/walkers.rs`).
-- The derived-name walkers build strings ONLY at the `NameTable`
-  interning/emission boundary — the psyche ruled of them "that is necessary." They
-  are never reached inside the Nomos schema-to-logos transformation, which is
-  stringless by his ruling that "in the nomos transformation (schema to logos),
-  there shall be no string manipulation/introduction/reading of any kind." String
-  work here is a boundary concern; the transformation between stringless forms
-  stays index-only.
+## Allocation and sealing
 
-## Code map
+Declarations allocate; references only resolve.
 
-- `src/lib.rs` — module root and public re-exports.
-- `src/identifier.rs` — `Identifier`.
-- `src/name.rs` — `Name`, `DerivedCasing`, the derived-name walkers.
-- `src/table.rs` — `NameTable`, `NameTableDomain`.
-- `src/transaction.rs` — `NameTransaction`.
-- `src/boundary.rs` — `NameResolver`, `NameInterner`.
-- `src/projection.rs` — `TextualProjection`.
-- `src/error.rs` — `NameTableError`.
-- `tests/interning.rs` — determinism, resolve round-trips, boundary capabilities.
-- `tests/continuity.rs` — borrowed-slice composition, duplicate namespace, and
-  sealed-home behavior.
-- `tests/transaction.rs` — rollback/commit and the interning-atomicity law.
-- `tests/walkers.rs` — derived-name outputs vs the ported source expectations.
-- `tests/archive.rs` — portable archive round-trip of a populated table.
-- `tests/projection.rs` — the Textual-projection surface and rename-stability.
+Within one atomic universe seal:
+
+1. Validate the complete typed nested declaration graph.
+2. Refuse the same exact spelling declared twice in one module table as a
+   redefinition.
+3. Process parent tables before their child tables.
+4. Reuse the existing local encodedID for a spelling already present in its
+   owning table.
+5. Allocate unseen declaration spellings in canonical exact-byte order within
+   each table.
+6. Resolve references against committed state plus declarations staged by the
+   seal. An unresolved reference allocates nothing.
+7. Commit every affected head, immutable snapshot, cursor, and receipt
+   atomically, or commit nothing.
+
+Canonical ordering makes first allocation independent of declaration traversal
+order and gives the same declaration set the same request digest. Allocation is
+module-scoped: capacity exhaustion in one table never spills into another table,
+silently widens the identifier, or reuses an old local encodedID.
+
+The library provides generic state and transaction mechanisms. The translator
+daemon is the sole persistent writer and owns authentication, authorization,
+idempotent sealing, durable recovery, notifications, and its embedded sema
+database.
+
+## Rename
+
+Changing authored text is not an identity-preserving rename. If an Ethos text
+edit changes an unseen spelling in a module table, the next seal allocates a
+fresh encodedID and leaves the old entry allocated and orphaned. The allocation
+site must describe this behavior in code. The seal contract has no continuation
+field.
+
+The operational rename is the sole identity-preserving path. It targets one full
+encodedID chain and edits only the exact spelling stored for its final local ID
+in the owning table. The chain, any child-table address, and every descendant
+chain stay unchanged. Renaming a module is therefore the same operation as
+renaming a member.
+
+Rename reads the owning table head first. An immutable table returns a typed
+immutable-table failure before any entry lookup. A mutable-table rename also
+fails without writes for an unknown target, a spelling already present in that
+table, stale state, conflicting idempotency content, corrupt state, or commit
+failure.
+
+There is no move, alias, delete, retire, freeze, thaw, or mutability-changing
+operation in this target. Their policies are not to be inferred.
+
+## Projection boundary
+
+Human and language-specific names are views. Casing, composition,
+disambiguation, and deterministic textual field names remain typed projection
+data until a `TextualForm` evaluates them. Nomos may neither read nor construct
+strings. The legacy eager walkers and interning of derived spellings must not be
+treated as the target projection mechanism.
+
+## Current code map
+
+The files below belong to the legacy implementation that consumers currently
+pin:
+
+- `src/identifier.rs` — closed `IdentifierNamespace` and flat `Identifier`.
+- `src/table.rs` — flat home and borrowed slices, composition, archive, and
+  derived global spelling index.
+- `src/transaction.rs` — speculative flat-table interning.
+- `src/boundary.rs` — decoder-facing `NameResolver` and `NameInterner`.
+- `src/name.rs` — exact names plus eager derived-spelling walkers.
+- `src/projection.rs` — the existing textual-projection surface.
+- `src/error.rs` — legacy typed errors, including `NameIndexCollision`.
+
+The replacement archive and wire format must reject the flat archive explicitly;
+a flat component slice cannot be guessed into nested encodedID chains.

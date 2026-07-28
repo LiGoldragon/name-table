@@ -41,24 +41,44 @@ fn payload_corruption_is_refused() {
 
     assert!(matches!(
         NameTable::<FixtureRoot>::from_archive_bytes(bytes.as_ref()),
-        Err(NameTableError::Deserialize(_))
+        Err(NameTableError::ArchiveIntegrityMismatch)
+            | Err(NameTableError::Deserialize(_))
             | Err(NameTableError::SnapshotIntegrityMismatch { .. })
             | Err(NameTableError::InconsistentTableHead { .. })
     ));
 }
 
 #[test]
-fn invalid_envelope_and_legacy_version_are_typed_failures() {
+fn receipt_digest_corruption_is_refused() {
+    let (table, original_request, _) = populated();
+    let request_digest = table.request_digest(&original_request).unwrap();
+    let mut bytes = table.to_archive_bytes().unwrap();
+    let offset = bytes
+        .windows(request_digest.bytes().len())
+        .position(|window| window == request_digest.bytes())
+        .expect("the archived receipt contains its request digest");
+    bytes[offset] ^= 0x80;
+
+    assert!(matches!(
+        NameTable::<FixtureRoot>::from_archive_bytes(bytes.as_ref()),
+        Err(NameTableError::ArchiveIntegrityMismatch)
+    ));
+}
+
+#[test]
+fn invalid_envelope_and_legacy_versions_are_typed_failures() {
     assert!(matches!(
         NameTable::<FixtureRoot>::from_archive_bytes(b"not an archive"),
         Err(NameTableError::InvalidArchiveEnvelope)
     ));
 
     let (table, _, _) = populated();
-    let mut bytes = table.to_archive_bytes().unwrap();
-    bytes[8..10].copy_from_slice(&1_u16.to_le_bytes());
-    assert!(matches!(
-        NameTable::<FixtureRoot>::from_archive_bytes(bytes.as_ref()),
-        Err(NameTableError::UnsupportedArchiveVersion { found: 1 })
-    ));
+    for version in [1_u16, 2_u16] {
+        let mut bytes = table.to_archive_bytes().unwrap();
+        bytes[8..10].copy_from_slice(&version.to_le_bytes());
+        assert!(matches!(
+            NameTable::<FixtureRoot>::from_archive_bytes(bytes.as_ref()),
+            Err(NameTableError::UnsupportedArchiveVersion { found }) if found == version
+        ));
+    }
 }

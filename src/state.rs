@@ -183,6 +183,31 @@ pub type SnapshotDigest = ContentHash<SnapshotIntegrityDomain>;
 /// Digest of a seal's canonical nested graph, excluding its idempotency key.
 pub type RequestDigest = ContentHash<SealRequestDomain>;
 
+/// One table generation and immutable snapshot created by a successful seal.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct TableChange<Root> {
+    pub(crate) address: TableAddress<Root>,
+    pub(crate) generation: TableGeneration,
+    pub(crate) snapshot: SnapshotDigest,
+}
+
+impl<Root> TableChange<Root> {
+    /// The table whose committed head changed.
+    pub fn address(&self) -> &TableAddress<Root> {
+        &self.address
+    }
+
+    /// The resulting immutable generation.
+    pub fn generation(&self) -> TableGeneration {
+        self.generation
+    }
+
+    /// The exact resulting immutable snapshot locator.
+    pub fn snapshot(&self) -> SnapshotDigest {
+        self.snapshot
+    }
+}
+
 /// The current mutable head of one table.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct ModuleTableHead<Root> {
@@ -289,6 +314,7 @@ impl<Root> ResolvedName<Root> {
 pub struct SealReceipt<Root> {
     pub(crate) operation_key: OperationKey,
     pub(crate) request_digest: RequestDigest,
+    pub(crate) changed_tables: Vec<TableChange<Root>>,
     pub(crate) declarations: Vec<ResolvedName<Root>>,
     pub(crate) references: Vec<ResolvedName<Root>>,
     pub(crate) resulting_revision: StateRevision,
@@ -305,7 +331,15 @@ impl<Root> SealReceipt<Root> {
         self.request_digest
     }
 
-    /// Every declaration result in canonical path order.
+    /// Every table generation and snapshot created by this seal.
+    ///
+    /// The records are ordered by table address and remain exact during an
+    /// idempotent replay even if those tables have advanced since the seal.
+    pub fn changed_tables(&self) -> &[TableChange<Root>] {
+        &self.changed_tables
+    }
+
+    /// Every declaration result in deterministic parent-before-child order.
     pub fn declarations(&self) -> &[ResolvedName<Root>] {
         &self.declarations
     }

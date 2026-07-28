@@ -1,6 +1,6 @@
 mod common;
 
-use common::{FixtureRoot, authored, key, member, module, path};
+use common::{FixtureRoot, authored, declared_id, key, member, module, path};
 use name_table::{
     NameReference, NameTable, NameTableError, SealRequest, TableAddress, TableMutability,
 };
@@ -91,6 +91,46 @@ fn identical_idempotent_replay_returns_the_original_receipt_without_advancing() 
 
     assert_eq!(replay, first);
     assert_eq!(table.revision(), revision);
+}
+
+#[test]
+fn replay_retains_the_original_changed_table_snapshots() {
+    let mut table = NameTable::new();
+    let request = SealRequest::new(key(47), vec![authored(vec![member("Status")])], vec![]);
+    let first = table.seal(request.clone()).unwrap();
+    let status = declared_id(&first, &[], "Status");
+    let changed = first
+        .changed_tables()
+        .iter()
+        .find(|change| change.address() == &status.owning_table())
+        .expect("the first seal changed the root table");
+
+    table
+        .seal(SealRequest::new(
+            key(48),
+            vec![authored(vec![member("State")])],
+            vec![],
+        ))
+        .unwrap();
+    assert_ne!(
+        changed.snapshot(),
+        table.head(changed.address()).unwrap().current_snapshot()
+    );
+
+    let revision = table.revision();
+    let replay = table.seal(request).unwrap();
+    assert_eq!(replay, first);
+    assert_eq!(replay.changed_tables(), first.changed_tables());
+    assert_eq!(table.revision(), revision);
+    assert_eq!(
+        table
+            .snapshot(changed.snapshot())
+            .unwrap()
+            .resolve_local(status.local())
+            .unwrap()
+            .as_str(),
+        "Status"
+    );
 }
 
 #[test]

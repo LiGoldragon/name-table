@@ -23,6 +23,9 @@ module-local `u16` encoded IDs.
   spellings in canonical exact-byte order within each table, resolves
   references against committed plus staged declarations, and commits
   everything or nothing.
+- Seal receipts retain the exact table generations and immutable snapshot
+  locators created by the operation, so idempotent replay returns the original
+  result after later table changes.
 - Operational rename changes one exact spelling while preserving the complete
   target chain, any child-table address, and every descendant chain.
 - Immutable tables refuse rename before target lookup.
@@ -37,9 +40,10 @@ recursive per-thing content-hashing decision.
 
 ## Archive
 
-Version 0.2 uses archive layout 2 for complete nested-table state and durable
-idempotency receipts. Layout 1's flat component slices are rejected explicitly;
-they cannot be inferred into module chains.
+Version 0.3 uses archive layout 3 for complete nested-table state, durable
+idempotency receipts, and whole-payload integrity. Layout 1's flat component
+slices and layout 2's incomplete receipt records are rejected explicitly; they
+cannot be inferred into module chains or exact replay results.
 
 ## Build and test
 

@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use content_identity::{ContentHash, HashDomain, PortableArchive};
+use content_identity::{ContentHash, DomainSeparation, HashDomain, LayoutVersion, PortableArchive};
 
 use crate::error::NameTableError;
 use crate::state::{
@@ -71,7 +71,18 @@ struct ArchiveState<Root> {
 struct ArchiveVersion(u16);
 
 impl ArchiveVersion {
-    const CURRENT: Self = Self(2);
+    const CURRENT: Self = Self(3);
+}
+
+struct ArchiveIntegrityDomain;
+
+impl HashDomain for ArchiveIntegrityDomain {
+    fn separation() -> DomainSeparation {
+        DomainSeparation::Contextual {
+            context: "name-table archive envelope integrity",
+            layout: LayoutVersion::new(1),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,7 +92,8 @@ struct ArchiveEnvelope {
 
 impl ArchiveEnvelope {
     const MAGIC: [u8; 8] = *b"NTABLE\0\0";
-    const HEADER_LEN: usize = Self::MAGIC.len() + std::mem::size_of::<u16>();
+    const VERSIONED_HEADER_LEN: usize = Self::MAGIC.len() + std::mem::size_of::<u16>();
+    const HEADER_LEN: usize = Self::VERSIONED_HEADER_LEN + 32;
 
     const fn current() -> Self {
         Self {
@@ -93,28 +105,42 @@ impl ArchiveEnvelope {
         let mut bytes = rkyv::util::AlignedVec::with_capacity(Self::HEADER_LEN + payload.len());
         bytes.extend_from_slice(&Self::MAGIC);
         bytes.extend_from_slice(&self.version.0.to_le_bytes());
+        bytes.extend_from_slice(ContentHash::<ArchiveIntegrityDomain>::derive(payload).bytes());
         bytes.extend_from_slice(payload);
         bytes
     }
 
     fn open(bytes: &[u8]) -> Result<&[u8], ArchiveEnvelopeError> {
-        if bytes.len() < Self::HEADER_LEN || bytes[..Self::MAGIC.len()] != Self::MAGIC {
+        if bytes.len() < Self::VERSIONED_HEADER_LEN || bytes[..Self::MAGIC.len()] != Self::MAGIC {
             return Err(ArchiveEnvelopeError::Invalid);
         }
         let version = u16::from_le_bytes(
-            bytes[Self::MAGIC.len()..Self::HEADER_LEN]
+            bytes[Self::MAGIC.len()..Self::VERSIONED_HEADER_LEN]
                 .try_into()
                 .map_err(|_| ArchiveEnvelopeError::Invalid)?,
         );
         if version != ArchiveVersion::CURRENT.0 {
             return Err(ArchiveEnvelopeError::Unsupported(version));
         }
-        Ok(&bytes[Self::HEADER_LEN..])
+        if bytes.len() < Self::HEADER_LEN {
+            return Err(ArchiveEnvelopeError::Invalid);
+        }
+        let expected = ContentHash::<ArchiveIntegrityDomain>::from_bytes(
+            bytes[Self::VERSIONED_HEADER_LEN..Self::HEADER_LEN]
+                .try_into()
+                .map_err(|_| ArchiveEnvelopeError::Invalid)?,
+        );
+        let payload = &bytes[Self::HEADER_LEN..];
+        if expected != ContentHash::<ArchiveIntegrityDomain>::derive(payload) {
+            return Err(ArchiveEnvelopeError::Integrity);
+        }
+        Ok(payload)
     }
 }
 
 enum ArchiveEnvelopeError {
     Invalid,
+    Integrity,
     Unsupported(u16),
 }
 
@@ -123,7 +149,7 @@ impl<Root> NameTable<Root>
 where
     Root: Clone + Ord,
 {
-    /// Serialize the complete generic nested-table state under archive layout 2.
+    /// Serialize the complete generic nested-table state under archive layout 3.
     pub fn to_archive_bytes(&self) -> Result<rkyv::util::AlignedVec, NameTableError<Root>>
     where
         ArchiveState<Root>: PortableArchive,
@@ -157,9 +183,10 @@ where
         Ok(ArchiveEnvelope::current().seal(payload.as_ref()))
     }
 
-    /// Reconstruct and validate complete state from archive layout 2.
+    /// Reconstruct and validate complete state from archive layout 3.
     ///
-    /// Legacy flat archives carry version 1 and are rejected explicitly.
+    /// Legacy flat archives carry version 1. The incomplete nested archive
+    /// carries version 2. Both are rejected explicitly.
     pub fn from_archive_bytes(bytes: &[u8]) -> Result<Self, NameTableError<Root>>
     where
         ArchiveState<Root>: PortableArchive,
@@ -193,6 +220,7 @@ where
     {
         let payload = ArchiveEnvelope::open(bytes).map_err(|error| match error {
             ArchiveEnvelopeError::Invalid => NameTableError::InvalidArchiveEnvelope,
+            ArchiveEnvelopeError::Integrity => NameTableError::ArchiveIntegrityMismatch,
             ArchiveEnvelopeError::Unsupported(found) => {
                 NameTableError::UnsupportedArchiveVersion { found }
             }

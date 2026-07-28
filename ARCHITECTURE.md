@@ -3,8 +3,8 @@
 ## Status boundary
 
 `name-table` is the string/encodedID correspondence library in the shared
-language substrate. Version 0.2 implements the generic nested-table foundation.
-Consumers pinned to earlier published revisions still see the legacy flat
+language substrate. Version 0.3 implements the generic nested-table foundation.
+Consumers pinned to revisions before 0.2 still see the legacy flat
 component-slice API until the coordinated breaking train repins them.
 
 ## Nested identity
@@ -78,6 +78,11 @@ order and gives the same declaration set the same request digest. Allocation is
 module-scoped: capacity exhaustion in one table never spills into another table,
 silently widens the identifier, or reuses an old local encodedID.
 
+Each successful seal receipt records the exact generation and immutable
+snapshot locator for every table changed by that seal. Idempotent replay returns
+those historical records unchanged even after later operations advance the
+table heads.
+
 The library provides generic state, staging, versioned archive, snapshot
 integrity, and idempotent receipt mechanisms. The eventual translator daemon is
 the sole persistent writer and owns authentication, authorization, durable
@@ -126,7 +131,7 @@ treated as the target projection mechanism.
   and stored-state validation.
 - `src/transaction.rs` — pure staged seal and rename values with stale-base
   commit refusal and effect-free rollback.
-- `src/archive.rs` — archive layout 2 and explicit rejection of the flat
-  archive.
+- `src/archive.rs` — integrity-protected archive layout 3 and explicit
+  rejection of incomplete earlier layouts.
 - `src/name.rs` — exact spelling only; no eager casing or derivation.
 - `src/error.rs` — typed no-write failures.

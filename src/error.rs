@@ -120,6 +120,10 @@ pub enum NameTableError<Root> {
     #[error("the nested name-table archive envelope is missing or corrupt")]
     InvalidArchiveEnvelope,
 
+    /// The archive payload does not match its envelope integrity digest.
+    #[error("the nested name-table archive payload failed integrity validation")]
+    ArchiveIntegrityMismatch,
+
     /// The envelope selects a layout this crate does not support.
     #[error("the nested name-table archive version {found} is unsupported")]
     UnsupportedArchiveVersion { found: u16 },

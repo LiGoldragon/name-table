@@ -1,6 +1,6 @@
 mod common;
 
-use common::{FixtureRoot, authored, declared_id, key, member, module, path};
+use common::{FixtureRoot, authored, declared_id, key, member, module, path, vocabulary};
 use name_table::{
     Declaration, LocalEncodedId, Name, NameReference, NameTable, NameTableError, RootDeclaration,
     SealRequest, TableAddress, TableMutability,
@@ -132,24 +132,30 @@ fn references_resolve_against_declarations_staged_by_the_same_seal() {
 
 #[test]
 fn allocation_and_digest_are_independent_of_traversal_order() {
-    let roots_a = vec![authored(vec![
-        member("Zulu"),
-        module(
-            "billing",
-            TableMutability::Mutable,
-            vec![member("Total"), member("Invoice")],
-        ),
-        member("Alpha"),
-    ])];
-    let roots_b = vec![authored(vec![
-        member("Alpha"),
-        module(
-            "billing",
-            TableMutability::Mutable,
-            vec![member("Invoice"), member("Total")],
-        ),
-        member("Zulu"),
-    ])];
+    let roots_a = vec![
+        vocabulary(vec![member("struct")]),
+        authored(vec![
+            member("Zulu"),
+            module(
+                "billing",
+                TableMutability::Mutable,
+                vec![member("Total"), member("Invoice")],
+            ),
+            member("Alpha"),
+        ]),
+    ];
+    let roots_b = vec![
+        authored(vec![
+            member("Alpha"),
+            module(
+                "billing",
+                TableMutability::Mutable,
+                vec![member("Invoice"), member("Total")],
+            ),
+            member("Zulu"),
+        ]),
+        vocabulary(vec![member("struct")]),
+    ];
     let references_a = vec![
         NameReference::new(path(&["billing"]), "Total"),
         NameReference::new(path(&[]), "Alpha"),
@@ -169,6 +175,9 @@ fn allocation_and_digest_are_independent_of_traversal_order() {
     let receipt_b = second.seal(request_b).unwrap();
 
     assert_eq!(digest_a, digest_b);
+    assert_eq!(receipt_a.changed_tables(), receipt_b.changed_tables());
+    assert_eq!(receipt_a.declarations(), receipt_b.declarations());
+    assert_eq!(receipt_a.references(), receipt_b.references());
     for (modules, spelling) in [
         (&[][..], "Alpha"),
         (&[][..], "Zulu"),

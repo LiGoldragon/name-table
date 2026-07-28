@@ -11,8 +11,9 @@
 //! graph through pure staging, and [`RenameRequest`] changes one spelling while
 //! preserving the target chain and all descendant chains.
 //!
-//! Archive version 2 is a deliberate break from the former flat component-slice
-//! format. Old archives are rejected rather than guessed into module chains.
+//! Archive version 3 adds whole-payload integrity and exact changed-snapshot
+//! receipt records. Earlier archives are rejected rather than guessed into
+//! module chains or replay results.
 
 mod archive;
 mod error;
@@ -32,8 +33,8 @@ pub use request::{
 };
 pub use state::{
     AllocationCursor, ModuleTableHead, ModuleTableSnapshot, OperationKey, RenameReceipt,
-    RequestDigest, ResolvedName, SealReceipt, SnapshotDigest, StateRevision, TableGeneration,
-    TableMutability,
+    RequestDigest, ResolvedName, SealReceipt, SnapshotDigest, StateRevision, TableChange,
+    TableGeneration, TableMutability,
 };
 pub use table::NameTable;
 pub use transaction::{StagedRename, StagedSeal};

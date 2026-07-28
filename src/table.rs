@@ -12,7 +12,7 @@ use crate::request::{
 use crate::state::{
     AllocationCursor, ModuleTableHead, ModuleTableSnapshot, OperationKey, OperationReceipt,
     RenameReceipt, RequestDigest, ResolvedName, SealReceipt, SealRequestDomain, SnapshotDigest,
-    SnapshotIntegrityDomain, StateRevision, TableGeneration, TableMutability,
+    SnapshotIntegrityDomain, StateRevision, TableChange, TableGeneration, TableMutability,
 };
 use crate::transaction::{StagedRename, StagedSeal};
 use crate::{EncodedId, Name, TableAddress};
@@ -230,7 +230,9 @@ where
         let mut staged = self.clone();
         let mut declarations = Vec::new();
 
-        for root in request.roots() {
+        let mut roots = request.roots().iter().collect::<Vec<_>>();
+        roots.sort_by(|left, right| left.root().cmp(right.root()));
+        for root in roots {
             let address = TableAddress::root(root.root().clone());
             staged.ensure_table(&address, root.mutability())?;
             staged.apply_declarations(
@@ -250,6 +252,16 @@ where
             });
         }
 
+        let changed_tables = staged
+            .heads
+            .iter()
+            .filter(|(address, head)| self.heads.get(*address) != Some(*head))
+            .map(|(address, head)| TableChange {
+                address: address.clone(),
+                generation: head.generation,
+                snapshot: head.current_snapshot,
+            })
+            .collect();
         let resulting_revision = staged
             .revision
             .next()
@@ -258,6 +270,7 @@ where
         let receipt = SealReceipt {
             operation_key: request.operation_key(),
             request_digest,
+            changed_tables,
             declarations,
             references,
             resulting_revision,
@@ -525,6 +538,28 @@ where
                         return Err(NameTableError::InconsistentReceipt {
                             operation_key: *operation_key,
                         });
+                    }
+                    let mut changed_addresses = BTreeSet::new();
+                    for change in &receipt.changed_tables {
+                        let Some(snapshot) = self.snapshots.get(&change.snapshot) else {
+                            return Err(NameTableError::InconsistentReceipt {
+                                operation_key: *operation_key,
+                            });
+                        };
+                        let Some(head) = self.heads.get(&change.address) else {
+                            return Err(NameTableError::InconsistentReceipt {
+                                operation_key: *operation_key,
+                            });
+                        };
+                        if !changed_addresses.insert(&change.address)
+                            || snapshot.address != change.address
+                            || snapshot.generation != change.generation
+                            || change.generation > head.generation
+                        {
+                            return Err(NameTableError::InconsistentReceipt {
+                                operation_key: *operation_key,
+                            });
+                        }
                     }
                     for resolved in receipt.declarations.iter().chain(receipt.references.iter()) {
                         if resolved.encoded_id.chain().is_empty() {

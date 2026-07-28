@@ -1,6 +1,6 @@
 //! Persistent state records and typed digests.
 
-use content_identity::{ContentHash, DomainSeparation, HashDomain, LayoutVersion};
+use content_identity::{DomainSeparation, HashDomain, IntegrityDigest, LayoutVersion};
 
 use crate::{EncodedId, LocalEncodedId, Name, NamePath, TableAddress};
 
@@ -178,10 +178,10 @@ impl HashDomain for SealRequestDomain {
 /// Integrity locator for one immutable table snapshot.
 ///
 /// This digest is caching and corruption-detection metadata only.
-pub type SnapshotDigest = ContentHash<SnapshotIntegrityDomain>;
+pub type SnapshotDigest = IntegrityDigest<SnapshotIntegrityDomain>;
 
 /// Digest of a seal's canonical nested graph, excluding its idempotency key.
-pub type RequestDigest = ContentHash<SealRequestDomain>;
+pub type RequestDigest = IntegrityDigest<SealRequestDomain>;
 
 /// One table generation and immutable snapshot created by a successful seal.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, Eq, PartialEq)]

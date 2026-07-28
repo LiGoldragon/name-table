@@ -2,7 +2,10 @@
 
 use std::collections::BTreeMap;
 
-use content_identity::{ContentHash, DomainSeparation, HashDomain, LayoutVersion, PortableArchive};
+use content_identity::{
+    DomainSeparation, HashDomain, IntegrityDigest, IntegrityEnvelope, LayoutVersion,
+    PortableArchive,
+};
 
 use crate::error::NameTableError;
 use crate::state::{
@@ -41,7 +44,7 @@ impl<Root: Clone> SnapshotMaterial<Root> {
     }
 }
 
-pub(crate) fn typed_digest<Domain, Value>(value: &Value) -> Result<ContentHash<Domain>, String>
+pub(crate) fn typed_digest<Domain, Value>(value: &Value) -> Result<IntegrityDigest<Domain>, String>
 where
     Domain: HashDomain,
     Value: PortableArchive,
@@ -56,7 +59,7 @@ where
             >,
         >,
 {
-    ContentHash::<Domain>::of_core(value).map_err(|error| error.to_string())
+    IntegrityDigest::<Domain>::of_core(value).map_err(|error| error.to_string())
 }
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone)]
@@ -102,11 +105,14 @@ impl ArchiveEnvelope {
     }
 
     fn seal(self, payload: &[u8]) -> rkyv::util::AlignedVec {
+        let mut canonical_payload = rkyv::util::AlignedVec::with_capacity(payload.len());
+        canonical_payload.extend_from_slice(payload);
+        let integrity = IntegrityEnvelope::<ArchiveIntegrityDomain>::seal(canonical_payload);
         let mut bytes = rkyv::util::AlignedVec::with_capacity(Self::HEADER_LEN + payload.len());
         bytes.extend_from_slice(&Self::MAGIC);
         bytes.extend_from_slice(&self.version.0.to_le_bytes());
-        bytes.extend_from_slice(ContentHash::<ArchiveIntegrityDomain>::derive(payload).bytes());
-        bytes.extend_from_slice(payload);
+        bytes.extend_from_slice(integrity.integrity().bytes());
+        bytes.extend_from_slice(integrity.payload());
         bytes
     }
 
@@ -125,13 +131,13 @@ impl ArchiveEnvelope {
         if bytes.len() < Self::HEADER_LEN {
             return Err(ArchiveEnvelopeError::Invalid);
         }
-        let expected = ContentHash::<ArchiveIntegrityDomain>::from_bytes(
+        let expected = IntegrityDigest::<ArchiveIntegrityDomain>::from_bytes(
             bytes[Self::VERSIONED_HEADER_LEN..Self::HEADER_LEN]
                 .try_into()
                 .map_err(|_| ArchiveEnvelopeError::Invalid)?,
         );
         let payload = &bytes[Self::HEADER_LEN..];
-        if expected != ContentHash::<ArchiveIntegrityDomain>::derive(payload) {
+        if expected != IntegrityDigest::<ArchiveIntegrityDomain>::derive(payload) {
             return Err(ArchiveEnvelopeError::Integrity);
         }
         Ok(payload)

@@ -1,129 +1,117 @@
-//! Transactional interning: a rolled-back or failed alternative leaves the table
-//! observably identical (down to its archived bytes and identity); a committed
-//! one merges its staged names at their staged identifiers.
+mod common;
 
-use name_table::{Identifier, IdentifierNamespace, Name, NameTable, NameTableError};
-
-fn populated() -> NameTable {
-    let mut table = NameTable::new(IdentifierNamespace::Schema);
-    table
-        .intern(Name::new("CommitSequence"))
-        .expect("schema allocation");
-    table.intern(Name::new("Field")).expect("schema allocation");
-    table
-}
+use common::{FixtureRoot, authored, key, member, module, path};
+use name_table::{
+    NameReference, NameTable, NameTableError, SealRequest, TableAddress, TableMutability,
+};
 
 #[test]
-fn a_dropped_transaction_leaves_the_table_byte_identical() {
-    let mut table = populated();
-    let before_bytes = table.to_archive_bytes().unwrap();
-    let before_identity = table.identity().unwrap();
-    let before_len = table.len();
-
+fn dropped_and_explicitly_rolled_back_stages_have_no_effect() {
+    let table = NameTable::new();
+    let before = table.clone();
     {
-        let mut transaction = table.begin();
-        transaction
-            .intern(Name::new("Speculative"))
-            .expect("staged allocation");
-        transaction
-            .intern(Name::new("AnotherOne"))
-            .expect("staged allocation");
-        // Dropped without commit: an implicit, effect-free rollback.
+        let _staged = table
+            .stage_seal(SealRequest::new(
+                key(40),
+                vec![authored(vec![member("Staged")])],
+                vec![],
+            ))
+            .unwrap();
     }
+    assert_eq!(table, before);
 
-    assert_eq!(table.len(), before_len);
-    assert_eq!(
-        table.to_archive_bytes().unwrap().as_ref(),
-        before_bytes.as_ref()
-    );
-    assert_eq!(table.identity().unwrap(), before_identity);
+    table
+        .stage_seal(SealRequest::new(
+            key(41),
+            vec![authored(vec![member("RolledBack")])],
+            vec![],
+        ))
+        .unwrap()
+        .rollback();
+    assert_eq!(table, before);
 }
 
 #[test]
-fn an_explicit_rollback_leaves_the_table_byte_identical() {
-    let mut table = populated();
-    let before_bytes = table.to_archive_bytes().unwrap();
+fn multi_table_failure_rolls_back_every_allocation_and_head() {
+    let mut table = NameTable::new();
+    let before = table.clone();
+    let result = table.seal(SealRequest::new(
+        key(42),
+        vec![authored(vec![
+            module("billing", TableMutability::Mutable, vec![member("Invoice")]),
+            module("tasks", TableMutability::Mutable, vec![member("Status")]),
+        ])],
+        vec![NameReference::new(path(&["billing"]), "Missing")],
+    ));
 
-    let mut transaction = table.begin();
-    transaction
-        .intern(Name::new("Speculative"))
-        .expect("staged allocation");
-    transaction.rollback();
-
-    assert_eq!(
-        table.to_archive_bytes().unwrap().as_ref(),
-        before_bytes.as_ref()
-    );
-}
-
-#[test]
-fn a_commit_merges_staged_names_at_their_staged_identifiers() {
-    let mut table = populated();
-    let before_len = table.len();
-
-    let mut transaction = table.begin();
-    let staged = transaction
-        .intern(Name::new("Committed"))
-        .expect("staged allocation");
-    // The staged identifier occupies the index above the committed table.
-    assert_eq!(
-        staged,
-        Identifier::Schema(u16::try_from(before_len).unwrap())
-    );
-    transaction.commit().expect("commit staged names");
-
-    assert_eq!(table.len(), before_len + 1);
-    assert_eq!(table.resolve(staged).unwrap().as_str(), "Committed");
-}
-
-#[test]
-fn a_committed_name_dedups_inside_a_transaction_without_staging() {
-    let mut table = populated();
-    let committed = table.intern(Name::new("Field")).expect("schema allocation");
-
-    let mut transaction = table.begin();
-    let again = transaction
-        .intern(Name::new("Field"))
-        .expect("staged lookup");
-    assert_eq!(again, committed);
-    assert_eq!(transaction.staged_count(), 0);
-}
-
-#[test]
-fn a_staged_identifier_resolves_within_the_transaction() {
-    let mut table = populated();
-    let mut transaction = table.begin();
-    let staged = transaction
-        .intern(Name::new("Speculative"))
-        .expect("staged allocation");
-    assert_eq!(transaction.resolve(staged).unwrap().as_str(), "Speculative");
-}
-
-#[test]
-fn try_intern_rolls_back_a_failed_alternative() {
-    let mut table = populated();
-    let before_bytes = table.to_archive_bytes().unwrap();
-
-    let outcome: Result<(), NameTableError> = table.try_intern(|transaction| {
-        transaction.intern(Name::new("Doomed"))?;
-        Err(NameTableError::UnknownIdentifier(Identifier::Schema(99)))
-    });
-
-    assert!(outcome.is_err());
-    // No allocation effect: the interning-atomicity law.
-    assert_eq!(
-        table.to_archive_bytes().unwrap().as_ref(),
-        before_bytes.as_ref()
+    assert!(matches!(
+        result,
+        Err(NameTableError::UnresolvedReference { .. })
+    ));
+    assert_eq!(table, before);
+    assert!(
+        table
+            .head(&TableAddress::root(FixtureRoot::Authored))
+            .is_none()
     );
 }
 
 #[test]
-fn try_intern_commits_a_successful_alternative() {
-    let mut table = populated();
+fn a_stage_refuses_to_commit_over_a_newer_revision() {
+    let table = NameTable::new();
+    let staged = table
+        .stage_seal(SealRequest::new(
+            key(43),
+            vec![authored(vec![member("First")])],
+            vec![],
+        ))
+        .unwrap();
+    let mut advanced = table.clone();
+    advanced
+        .seal(SealRequest::new(
+            key(44),
+            vec![authored(vec![member("Second")])],
+            vec![],
+        ))
+        .unwrap();
 
-    let outcome: Result<Identifier, NameTableError> =
-        table.try_intern(|transaction| transaction.intern(Name::new("Kept")));
+    assert!(matches!(
+        staged.commit(&mut advanced),
+        Err(NameTableError::StaleStage { .. })
+    ));
+}
 
-    let identifier = outcome.expect("alternative succeeded");
-    assert_eq!(table.resolve(identifier).unwrap().as_str(), "Kept");
+#[test]
+fn identical_idempotent_replay_returns_the_original_receipt_without_advancing() {
+    let mut table = NameTable::new();
+    let request = SealRequest::new(key(45), vec![authored(vec![member("Status")])], vec![]);
+    let first = table.seal(request.clone()).unwrap();
+    let revision = table.revision();
+    let replay = table.seal(request).unwrap();
+
+    assert_eq!(replay, first);
+    assert_eq!(table.revision(), revision);
+}
+
+#[test]
+fn idempotency_key_reuse_with_different_content_is_refused_without_effect() {
+    let mut table = NameTable::new();
+    table
+        .seal(SealRequest::new(
+            key(46),
+            vec![authored(vec![member("Status")])],
+            vec![],
+        ))
+        .unwrap();
+    let before = table.clone();
+
+    assert!(matches!(
+        table.seal(SealRequest::new(
+            key(46),
+            vec![authored(vec![member("State")])],
+            vec![],
+        )),
+        Err(NameTableError::IdempotencyConflict { .. })
+    ));
+    assert_eq!(table, before);
 }

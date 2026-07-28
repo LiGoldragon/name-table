@@ -1,5 +1,5 @@
 {
-  description = "name-table — the stringless-Core identifier space and its interning table";
+  description = "name-table — generic nested module-owned name tables";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";

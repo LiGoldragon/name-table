@@ -1,11 +1,11 @@
 [package]
 name         = "name-table"
-version      = "0.1.0"
+version      = "0.2.0"
 edition      = "2024"
 rust-version = "1.85"
 license      = "MIT OR Apache-2.0"
 repository   = "https://github.com/LiGoldragon/name-table"
-description  = "The stringless-Core identifier space: Identifier indices, the interning NameTable with a transactional staging surface, and the one home for the derived-name walkers."
+description  = "Generic nested module-owned name tables with durable encoded-ID chains and atomic staging."
 publish      = false
 
 [lib]

@@ -1,54 +1,39 @@
-//! The stringless-Core identifier space and its name interning.
+//! Generic nested module-owned name tables.
 //!
-//! This is crate L2 of the shared-codec language family: `content-identity <-
-//! name-table <- raw-discovery <- structural-codec`. Every `Core*` type in the
-//! family is stringless — it carries [`Identifier`] values, never names — and
-//! all names live here, in a [`NameTable`]. That is the substrate on which the
-//! family's identity ruling stands: because a `Core` value holds no names, a
-//! rename is a table-only edit that can never move `Core` content identity.
+//! A root value selects one root table without this crate defining the
+//! production root set. Each module is an entry in its containing table and,
+//! structurally, owns the child table at that entry's complete [`EncodedId`].
+//! Every durable identity is therefore a root plus a non-empty chain of
+//! table-local [`LocalEncodedId`] values.
 //!
-//! ## What this crate owns
+//! Declarations allocate exact, case-sensitive spellings within one table.
+//! References only resolve. [`SealRequest`] applies a typed nested declaration
+//! graph through pure staging, and [`RenameRequest`] changes one spelling while
+//! preserving the target chain and all descendant chains.
 //!
-//! - [`Identifier`] — a closed namespace enum whose variants carry `u16` local
-//!   allocations, so identity is never flat-integer arithmetic.
-//! - [`NameTable`] — one component's composed view: a component-owned home
-//!   namespace plus complete borrowed read-only namespace slices, with
-//!   [`intern`](NameTable::intern) and [`resolve`](NameTable::resolve). Composition
-//!   preserves slices without copying, flattening, or renumbering identifiers.
-//! - [`NameTransaction`] — a speculative interning overlay that merges on commit,
-//!   so a failed decode alternative leaves no allocation effect (the accepted
-//!   transactional-interning hardening).
-//! - [`Name`] — the interned name and the ONE home of the derived-name rule
-//!   ([`field_name`](Name::field_name), [`screaming`](Name::screaming),
-//!   [`pascal_case`](Name::pascal_case)), consolidating walkers hand-written
-//!   independently in `schema` and `schema-rust`.
-//! - [`NameResolver`] / [`NameInterner`] — the two codec-boundary capabilities:
-//!   the read-only view an encode path is threaded, and the mutating view a decode
-//!   path is threaded.
-//! - [`TextualProjection`] — the surface for deriving a named `Textual*` view from
-//!   `Core` + a table. Concrete `Textual*` types belong to later crates.
-//!
-//! ## Names never serialize with Core values
-//!
-//! A table archives only its owned namespace slice and ordered canonical names;
-//! borrowed slices remain independently archived. The lookup accelerator is
-//! derived and never serialized. Content identity for a `Core` value comes from
-//! `content-identity` over that value's stringless bytes,
-//! which contain no names. So names and `Core` values are structurally incapable
-//! of sharing a pre-image.
+//! Archive version 2 is a deliberate break from the former flat component-slice
+//! format. Old archives are rejected rather than guessed into module chains.
 
-mod boundary;
+mod archive;
 mod error;
-mod identifier;
+mod identity;
 mod name;
-mod projection;
+mod request;
+mod state;
 mod table;
 mod transaction;
 
-pub use boundary::{NameInterner, NameResolver};
-pub use error::NameTableError;
-pub use identifier::{Identifier, IdentifierNamespace};
+pub use error::{EmptyEncodedId, NameTableError};
+pub use identity::{EncodedId, LocalEncodedId, TableAddress};
 pub use name::Name;
-pub use projection::TextualProjection;
-pub use table::{NameTable, NameTableDomain, NameTableSliceSnapshot};
-pub use transaction::NameTransaction;
+pub use request::{
+    Declaration, ModuleDeclaration, ModulePath, NamePath, NameReference, RenameRequest,
+    RootDeclaration, SealRequest,
+};
+pub use state::{
+    AllocationCursor, ModuleTableHead, ModuleTableSnapshot, OperationKey, RenameReceipt,
+    RequestDigest, ResolvedName, SealReceipt, SnapshotDigest, StateRevision, TableGeneration,
+    TableMutability,
+};
+pub use table::NameTable;
+pub use transaction::{StagedRename, StagedSeal};

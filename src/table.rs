@@ -1,517 +1,875 @@
-//! The composable interning identifier space.
+//! Generic nested-table state and operations.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
 
-use content_identity::{ContentHash, DomainSeparation, HashDomain, LayoutVersion, PortableArchive};
+use content_identity::PortableArchive;
 
-use crate::boundary::{NameInterner, NameResolver};
+use crate::archive::{SnapshotMaterial, typed_digest};
 use crate::error::NameTableError;
-use crate::identifier::{Identifier, IdentifierNamespace};
-use crate::name::Name;
-use crate::transaction::NameTransaction;
+use crate::request::{
+    Declaration, ModuleDeclaration, ModulePath, NamePath, NameReference, RenameRequest, SealRequest,
+};
+use crate::state::{
+    AllocationCursor, ModuleTableHead, ModuleTableSnapshot, OperationKey, OperationReceipt,
+    RenameReceipt, RequestDigest, ResolvedName, SealReceipt, SealRequestDomain, SnapshotDigest,
+    SnapshotIntegrityDomain, StateRevision, TableGeneration, TableMutability,
+};
+use crate::transaction::{StagedRename, StagedSeal};
+use crate::{EncodedId, Name, TableAddress};
 
-/// The hash domain of one namespace slice's content identity.
-///
-/// A slice has its own identity because a component borrows other slices instead
-/// of copying them. The composed view's borrowed edges are runtime topology;
-/// they are not duplicated into the home slice's stored content.
-pub struct NameTableDomain;
-
-impl HashDomain for NameTableDomain {
-    fn separation() -> DomainSeparation {
-        DomainSeparation::Contextual {
-            context: "name-table 2026 sliced identifier space",
-            layout: LayoutVersion::new(3),
-        }
-    }
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone)]
+struct CanonicalSeal<Root> {
+    roots: Vec<CanonicalRoot<Root>>,
+    declarations: Vec<CanonicalDeclaration<Root>>,
+    references: Vec<NameReference<Root>>,
 }
 
-/// One namespace's owned canonical names.
-///
-/// Each encoded identifier has exactly one canonical name in its component
-/// projection. Additional source or target-language spellings are not part of
-/// the language surface.
-#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-struct NameSlice {
-    namespace: IdentifierNamespace,
-    names: Vec<Name>,
+#[derive(
+    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, Eq, Ord, PartialEq, PartialOrd,
+)]
+struct CanonicalRoot<Root> {
+    root: Root,
+    mutability: TableMutability,
 }
 
-/// The storage-wire version of one home-slice archive.
-///
-/// This is intentionally separate from [`NameTableDomain`]'s hash layout
-/// version: the former selects a persisted byte decoder, while the latter
-/// separates content identities.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct NameTableArchiveVersion(u16);
-
-impl NameTableArchiveVersion {
-    const CURRENT: Self = Self(1);
+#[derive(
+    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, Eq, Ord, PartialEq, PartialOrd,
+)]
+struct CanonicalDeclaration<Root> {
+    root: Root,
+    table_path: Vec<Name>,
+    spelling: Name,
+    child_mutability: Option<TableMutability>,
 }
 
-/// The typed storage-wire header for one home-slice archive.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct NameTableArchiveEnvelope {
-    version: NameTableArchiveVersion,
+/// Complete generic nested-table state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NameTable<Root> {
+    pub(crate) revision: StateRevision,
+    pub(crate) heads: BTreeMap<TableAddress<Root>, ModuleTableHead<Root>>,
+    pub(crate) snapshots: BTreeMap<SnapshotDigest, ModuleTableSnapshot<Root>>,
+    pub(crate) receipts: BTreeMap<OperationKey, OperationReceipt<Root>>,
 }
 
-impl NameTableArchiveEnvelope {
-    const MAGIC: [u8; 8] = *b"NTABLE\0\0";
-    const HEADER_LEN: usize = Self::MAGIC.len() + std::mem::size_of::<u16>();
-
-    const fn current() -> Self {
+impl<Root> Default for NameTable<Root> {
+    fn default() -> Self {
         Self {
-            version: NameTableArchiveVersion::CURRENT,
+            revision: StateRevision::default(),
+            heads: BTreeMap::new(),
+            snapshots: BTreeMap::new(),
+            receipts: BTreeMap::new(),
         }
-    }
-
-    fn seal(self, payload: &[u8]) -> rkyv::util::AlignedVec {
-        let mut bytes = rkyv::util::AlignedVec::with_capacity(Self::HEADER_LEN + payload.len());
-        bytes.extend_from_slice(&Self::MAGIC);
-        bytes.extend_from_slice(&self.version.0.to_le_bytes());
-        bytes.extend_from_slice(payload);
-        bytes
-    }
-
-    fn open(bytes: &[u8]) -> Result<&[u8], NameTableError> {
-        if bytes.len() < Self::HEADER_LEN || bytes[..Self::MAGIC.len()] != Self::MAGIC {
-            return Err(NameTableError::InvalidArchiveEnvelope);
-        }
-
-        let version_bytes: [u8; std::mem::size_of::<u16>()] = bytes
-            [Self::MAGIC.len()..Self::HEADER_LEN]
-            .try_into()
-            .map_err(|_| NameTableError::InvalidArchiveEnvelope)?;
-        let version = NameTableArchiveVersion(u16::from_le_bytes(version_bytes));
-        if version != NameTableArchiveVersion::CURRENT {
-            return Err(NameTableError::UnsupportedArchiveVersion { found: version.0 });
-        }
-
-        Ok(&bytes[Self::HEADER_LEN..])
     }
 }
 
-impl NameSlice {
-    fn new(namespace: IdentifierNamespace) -> Self {
-        Self {
-            namespace,
-            names: Vec::new(),
-        }
+#[allow(private_bounds)]
+impl<Root> NameTable<Root>
+where
+    Root: Clone + Ord,
+{
+    /// Construct empty state. Root tables are provisioned by their first seal.
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    fn len(&self) -> usize {
-        self.names.len()
+    /// The current pure-state revision.
+    pub fn revision(&self) -> StateRevision {
+        self.revision
     }
 
-    fn name(&self, local: u16) -> Option<&Name> {
-        self.names.get(usize::from(local))
+    /// The current head of one table.
+    pub fn head(&self, address: &TableAddress<Root>) -> Option<&ModuleTableHead<Root>> {
+        self.heads.get(address)
     }
 
-    fn identifier_at(&self, position: usize) -> Result<Identifier, NameTableError> {
-        let local = u16::try_from(position)
-            .map_err(|_| NameTableError::NamespaceCapacity(self.namespace))?;
-        Ok(self.namespace.identifier(local))
+    /// One immutable historical snapshot by integrity locator.
+    pub fn snapshot(&self, digest: SnapshotDigest) -> Option<&ModuleTableSnapshot<Root>> {
+        self.snapshots.get(&digest)
     }
 
-    fn canonical_identifiers(&self) -> Result<Vec<(Name, Identifier)>, NameTableError> {
-        self.validate()?;
-        self.names
-            .iter()
-            .enumerate()
-            .map(|(position, name)| Ok((name.clone(), self.identifier_at(position)?)))
-            .collect()
-    }
-
-    fn validate(&self) -> Result<(), NameTableError> {
-        if self.names.len() > usize::from(u16::MAX) + 1 {
-            return Err(NameTableError::NamespaceCapacity(self.namespace));
-        }
-
-        let mut canonical_names = HashSet::with_capacity(self.names.len());
-        for name in &self.names {
-            if !canonical_names.insert(name) {
-                return Err(NameTableError::DuplicateCanonicalName(name.clone()));
+    /// The current immutable snapshot of one table.
+    pub fn current_snapshot(
+        &self,
+        address: &TableAddress<Root>,
+    ) -> Result<&ModuleTableSnapshot<Root>, NameTableError<Root>> {
+        let head = self
+            .heads
+            .get(address)
+            .ok_or_else(|| NameTableError::UnknownTable {
+                address: address.clone(),
+            })?;
+        self.snapshots.get(&head.current_snapshot).ok_or_else(|| {
+            NameTableError::InconsistentTableHead {
+                address: address.clone(),
             }
-        }
-        Ok(())
-    }
-
-    fn intern(&mut self, name: Name) -> Result<Identifier, NameTableError> {
-        let identifier = self.identifier_at(self.names.len())?;
-        self.names.push(name);
-        Ok(identifier)
-    }
-}
-
-/// One independently archived, namespace-tagged slice in a composed nametree.
-///
-/// The bytes are exactly the existing versioned home-slice archive for this
-/// namespace. A Capsule carries these descriptors separately instead of
-/// flattening borrowed slices into its home archive.
-#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct NameTableSliceSnapshot {
-    namespace: IdentifierNamespace,
-    archive_bytes: Vec<u8>,
-    identity: ContentHash<NameTableDomain>,
-}
-
-impl NameTableSliceSnapshot {
-    fn from_slice(slice: &NameSlice) -> Result<Self, NameTableError> {
-        let payload = slice
-            .to_archive_bytes()
-            .map_err(|error| NameTableError::Serialize(error.to_string()))?;
-        let archive_bytes = NameTableArchiveEnvelope::current()
-            .seal(payload.as_ref())
-            .to_vec();
-        let identity = ContentHash::<NameTableDomain>::of_core(slice)
-            .map_err(|error| NameTableError::Serialize(error.to_string()))?;
-        Ok(Self {
-            namespace: slice.namespace,
-            archive_bytes,
-            identity,
         })
     }
 
-    /// The namespace this independently pinned slice owns.
-    pub fn namespace(&self) -> IdentifierNamespace {
-        self.namespace
-    }
-
-    /// The slice's unchanged, versioned home-archive bytes.
-    pub fn archive_bytes(&self) -> &[u8] {
-        &self.archive_bytes
-    }
-
-    /// The existing identity of this one namespace slice.
-    pub fn identity(&self) -> ContentHash<NameTableDomain> {
-        self.identity
-    }
-
-    fn restore(&self) -> Result<NameTable, NameTableError> {
-        let table = NameTable::from_archive_bytes(&self.archive_bytes)?;
-        if table.namespace() != self.namespace {
-            return Err(NameTableError::SnapshotNamespaceMismatch {
-                expected: self.namespace,
-                actual: table.namespace(),
-            });
-        }
-        let actual = table.identity()?;
-        if actual != self.identity {
-            return Err(NameTableError::SnapshotIdentityMismatch {
-                namespace: self.namespace,
-            });
-        }
-        Ok(table)
-    }
-}
-
-/// An interned, composable map from [`Identifier`] to [`Name`].
-///
-/// A component owns exactly one home namespace and may borrow complete,
-/// read-only slices from other components. Composition stores shared `Arc`
-/// handles to those source slices; it does not copy source names, flatten source
-/// state, or renumber source identifiers. `intern` always allocates in the home
-/// namespace, while `resolve` dispatches exhaustively by identifier variant.
-///
-/// A source component completes its own allocations before another component
-/// borrows its slice. That lifecycle keeps the borrowed view immutable and makes
-/// namespace-local identifiers stable.
-///
-/// `NameTable` implements [`Clone`] because the structural codec's public `Converted`
-/// output is cloneable. A clone copies only the derived lookup accelerator; its home and
-/// every borrowed source slice remain the same `Arc` handles. Sharing the home `Arc`
-/// deliberately seals it in both values instead of using copy-on-write: clones cannot
-/// acquire divergent mutable ownership of one component namespace. Cloning never
-/// flattens, renumbers, or copies a borrowed namespace slice, and preserves the
-/// sealed-home lifecycle.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NameTable {
-    home: Arc<NameSlice>,
-    borrowed: BTreeMap<IdentifierNamespace, Arc<NameSlice>>,
-    index: HashMap<Name, Identifier>,
-}
-
-impl NameTable {
-    /// Create one component's empty NameTable with its owned allocation slice.
-    pub fn new(namespace: IdentifierNamespace) -> Self {
-        Self {
-            home: Arc::new(NameSlice::new(namespace)),
-            borrowed: BTreeMap::new(),
-            index: HashMap::new(),
-        }
-    }
-
-    fn from_slices(
-        home: Arc<NameSlice>,
-        borrowed: BTreeMap<IdentifierNamespace, Arc<NameSlice>>,
-    ) -> Result<Self, NameTableError> {
-        let mut table = Self {
-            home,
-            borrowed,
-            index: HashMap::new(),
-        };
-        table.rebuild_index()?;
-        Ok(table)
-    }
-
-    /// The namespace this component owns and appends to.
-    pub fn namespace(&self) -> IdentifierNamespace {
-        self.home.namespace
-    }
-
-    /// The number of names owned by this component's home slice.
-    pub fn len(&self) -> usize {
-        self.home.len()
-    }
-
-    /// Whether this component owns no names yet.
-    pub fn is_empty(&self) -> bool {
-        self.home.names.is_empty()
-    }
-
-    /// Borrow every completed source slice into this component's composed table.
-    ///
-    /// The source's names retain their original identifiers. A composed source
-    /// contributes both its home and every slice it already borrows, each by its
-    /// existing `Arc` handle. Borrowing a namespace already represented here is
-    /// rejected, because an identifier variant has one authoritative slice.
-    pub fn compose(&self, source: &NameTable) -> Result<Self, NameTableError> {
-        let mut borrowed = self.borrowed.clone();
-        let source_slices =
-            std::iter::once((&source.home.namespace, &source.home)).chain(source.borrowed.iter());
-
-        for (namespace, slice) in source_slices {
-            if *namespace == self.namespace() || borrowed.contains_key(namespace) {
-                return Err(NameTableError::DuplicateNamespace(*namespace));
-            }
-            borrowed.insert(*namespace, Arc::clone(slice));
-        }
-
-        Self::from_slices(Arc::clone(&self.home), borrowed)
-    }
-
-    /// Intern a canonical name into this component's home slice.
-    ///
-    /// A canonical source name already present in any composed slice resolves to
-    /// that existing identifier without reintroducing a string into Nomos.
-    pub fn intern(&mut self, name: Name) -> Result<Identifier, NameTableError> {
-        if let Some(identifier) = self.index.get(&name).copied() {
-            return Ok(identifier);
-        }
-
-        let home = Arc::get_mut(&mut self.home).ok_or(NameTableError::HomeSliceBorrowed {
-            operation: "intern a name",
-        })?;
-        let identifier = home.intern(name.clone())?;
-        self.index.insert(name, identifier);
-        Ok(identifier)
-    }
-
-    /// Resolve an identifier to its canonical primary name.
-    pub fn resolve(&self, identifier: Identifier) -> Result<&Name, NameTableError> {
-        self.slice(identifier.namespace())?
-            .name(identifier.local())
-            .ok_or(NameTableError::UnknownIdentifier(identifier))
-    }
-
-    /// Look up a canonical name without allocating.
-    pub fn lookup(&self, name: &Name) -> Option<Identifier> {
-        self.index.get(name).copied()
-    }
-
-    fn slice(&self, namespace: IdentifierNamespace) -> Result<&NameSlice, NameTableError> {
-        if namespace == self.namespace() {
-            return Ok(self.home.as_ref());
-        }
-        self.borrowed
-            .get(&namespace)
-            .map(Arc::as_ref)
-            .ok_or(NameTableError::UnknownNamespace(namespace))
-    }
-
-    fn rebuild_index(&mut self) -> Result<(), NameTableError> {
-        let mut identifiers = self.home.canonical_identifiers()?;
-        for slice in self.borrowed.values() {
-            identifiers.extend(slice.canonical_identifiers()?);
-        }
-
-        self.index.clear();
-        for (name, identifier) in identifiers {
-            self.insert_indexed_name(name, identifier)?;
-        }
-        Ok(())
-    }
-
-    fn insert_indexed_name(
-        &mut self,
-        name: Name,
-        identifier: Identifier,
-    ) -> Result<(), NameTableError> {
-        if let Some(existing) = self.index.insert(name.clone(), identifier) {
-            return Err(NameTableError::NameIndexCollision {
-                name,
-                first: existing,
-                second: identifier,
-            });
-        }
-        Ok(())
-    }
-
-    /// Open a speculative transaction over this table. Names interned through the
-    /// returned [`NameTransaction`] stage on the side; the committed table is not
-    /// touched until [`NameTransaction::commit`]. Dropping the transaction (or
-    /// calling [`NameTransaction::rollback`]) leaves this table byte-identical.
-    pub fn begin(&mut self) -> NameTransaction<'_> {
-        NameTransaction::new(self)
-    }
-
-    /// Run `attempt` against a speculative transaction, committing its interned
-    /// names only if it succeeds. A failed alternative leaves no allocation
-    /// effect: the table is byte-identical to before the call.
-    pub fn try_intern<Value, Failure>(
-        &mut self,
-        attempt: impl FnOnce(&mut NameTransaction<'_>) -> Result<Value, Failure>,
-    ) -> Result<Value, Failure>
-    where
-        Failure: From<NameTableError>,
-    {
-        let mut transaction = self.begin();
-        match attempt(&mut transaction) {
-            Ok(value) => {
-                transaction.commit().map_err(Failure::from)?;
-                Ok(value)
-            }
-            Err(failure) => {
-                transaction.rollback();
-                Err(failure)
-            }
-        }
-    }
-
-    /// Merge a transaction's staged names into the home slice.
-    pub(crate) fn commit_staged(&mut self, staged: Vec<Name>) -> Result<(), NameTableError> {
-        for name in staged {
-            self.intern(name)?;
-        }
-        Ok(())
-    }
-
-    /// The home slice's versioned canonical archive bytes. Borrowed slices are
-    /// deliberately excluded: they remain independently content-identified and
-    /// are composed again by their consumer rather than copied into this
-    /// component's state.
-    pub fn to_archive_bytes(&self) -> Result<rkyv::util::AlignedVec, NameTableError> {
-        let payload = self
-            .home
-            .as_ref()
-            .to_archive_bytes()
-            .map_err(|error| NameTableError::Serialize(error.to_string()))?;
-        Ok(NameTableArchiveEnvelope::current().seal(payload.as_ref()))
-    }
-
-    /// Reconstruct one uncomposed home slice from versioned canonical archive
-    /// bytes. Consumers compose required borrowed slices explicitly after
-    /// loading. Legacy raw rkyv bytes are rejected rather than bridged.
-    pub fn from_archive_bytes(bytes: &[u8]) -> Result<Self, NameTableError> {
-        let payload = NameTableArchiveEnvelope::open(bytes)?;
-        let archived = rkyv::access::<ArchivedNameSlice, rkyv::rancor::Error>(payload)
-            .map_err(|error| NameTableError::Deserialize(error.to_string()))?;
-        let names = archived.names.len();
-        if names > usize::from(u16::MAX) + 1 {
-            return Err(NameTableError::ArchivedNamespaceCapacity { names });
-        }
-
-        let home = NameSlice::from_archive_bytes(payload)
-            .map_err(|error| NameTableError::Deserialize(error.to_string()))?;
-        home.validate()?;
-        Self::from_slices(Arc::new(home), BTreeMap::new())
-    }
-
-    /// This home slice's content identity. Borrowed slices retain their own
-    /// identities and are not folded into this component's owned name data.
-    pub fn identity(&self) -> Result<ContentHash<NameTableDomain>, NameTableError> {
-        ContentHash::<NameTableDomain>::of_core(self.home.as_ref())
-            .map_err(|error| NameTableError::Serialize(error.to_string()))
-    }
-
-    /// Export the complete composed nametree as independently archived slices.
-    ///
-    /// The first value is the one owned home slice. The remaining values are
-    /// borrowed source slices in deterministic namespace order. Each archive is
-    /// the existing per-slice archive unchanged; this boundary never flattens,
-    /// copies, renumbers, or restamps names.
-    pub fn slice_snapshots(
+    /// Look up an exact spelling in one table without allocating.
+    pub fn lookup(
         &self,
-    ) -> Result<(NameTableSliceSnapshot, Vec<NameTableSliceSnapshot>), NameTableError> {
-        let home = NameTableSliceSnapshot::from_slice(self.home.as_ref())?;
-        let borrowed = self
-            .borrowed
-            .values()
-            .map(|slice| NameTableSliceSnapshot::from_slice(slice.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok((home, borrowed))
+        address: &TableAddress<Root>,
+        spelling: &Name,
+    ) -> Result<Option<EncodedId<Root>>, NameTableError<Root>> {
+        Ok(self
+            .current_snapshot(address)?
+            .lookup_local(spelling)
+            .map(|local| address.entry(local)))
     }
 
-    /// Restore a complete composed nametree from independently pinned slice
-    /// snapshots. The home remains owned and every other slice is borrowed by
-    /// composition; no snapshot is flattened into or reallocated by another.
-    pub fn from_slice_snapshots(
-        home: &NameTableSliceSnapshot,
-        borrowed: &[NameTableSliceSnapshot],
-    ) -> Result<Self, NameTableError> {
-        let mut restored = home.restore()?;
-        let mut namespaces = HashSet::new();
-        namespaces.insert(restored.namespace());
-        for snapshot in borrowed {
-            if !namespaces.insert(snapshot.namespace()) {
-                return Err(NameTableError::DuplicateNamespace(snapshot.namespace()));
-            }
-            restored = restored.compose(&snapshot.restore()?)?;
+    /// Resolve one complete encoded-ID chain through the current snapshot.
+    pub fn resolve(&self, encoded_id: &EncodedId<Root>) -> Result<&Name, NameTableError<Root>> {
+        let address = encoded_id.owning_table();
+        self.current_snapshot(&address)?
+            .resolve_local(encoded_id.local())
+            .ok_or_else(|| NameTableError::UnknownEncodedId {
+                encoded_id: encoded_id.clone(),
+            })
+    }
+
+    /// Resolve an identity against a specifically pinned historical snapshot.
+    pub fn resolve_in_snapshot(
+        &self,
+        snapshot: SnapshotDigest,
+        encoded_id: &EncodedId<Root>,
+    ) -> Result<&Name, NameTableError<Root>> {
+        let archived = self
+            .snapshots
+            .get(&snapshot)
+            .ok_or_else(|| NameTableError::SnapshotIntegrityMismatch { digest: snapshot })?;
+        if archived.address != encoded_id.owning_table() {
+            return Err(NameTableError::UnknownEncodedId {
+                encoded_id: encoded_id.clone(),
+            });
         }
-        Ok(restored)
+        archived
+            .resolve_local(encoded_id.local())
+            .ok_or_else(|| NameTableError::UnknownEncodedId {
+                encoded_id: encoded_id.clone(),
+            })
     }
-}
 
-impl NameResolver for NameTable {
-    fn resolve(&self, identifier: Identifier) -> Result<&Name, NameTableError> {
-        NameTable::resolve(self, identifier)
+    /// Compute the digest of a seal's canonical graph.
+    ///
+    /// Root graphs, declarations in each table, nested modules, and references
+    /// are sorted canonically. The operation key is deliberately excluded.
+    pub fn request_digest(
+        &self,
+        request: &SealRequest<Root>,
+    ) -> Result<RequestDigest, NameTableError<Root>>
+    where
+        CanonicalSeal<Root>: PortableArchive,
+        <CanonicalSeal<Root> as rkyv::Archive>::Archived:
+            rkyv::Deserialize<
+                    CanonicalSeal<Root>,
+                    rkyv::api::high::HighDeserializer<rkyv::rancor::Error>,
+                > + for<'validation> rkyv::bytecheck::CheckBytes<
+                    rkyv::rancor::Strategy<
+                        rkyv::validation::Validator<
+                            rkyv::validation::archive::ArchiveValidator<'validation>,
+                            rkyv::validation::shared::SharedValidator,
+                        >,
+                        rkyv::rancor::Error,
+                    >,
+                >,
+    {
+        typed_digest::<SealRequestDomain, _>(&canonical_seal(request))
+            .map_err(NameTableError::Serialize)
     }
-}
 
-impl NameInterner for NameTable {
-    fn intern(&mut self, name: Name) -> Result<Identifier, NameTableError> {
-        NameTable::intern(self, name)
-    }
-}
+    /// Purely stage one atomic nested seal. Dropping or rolling back the returned
+    /// value cannot mutate `self`.
+    pub fn stage_seal(
+        &self,
+        request: SealRequest<Root>,
+    ) -> Result<StagedSeal<Root>, NameTableError<Root>>
+    where
+        CanonicalSeal<Root>: PortableArchive,
+        <CanonicalSeal<Root> as rkyv::Archive>::Archived:
+            rkyv::Deserialize<
+                    CanonicalSeal<Root>,
+                    rkyv::api::high::HighDeserializer<rkyv::rancor::Error>,
+                > + for<'validation> rkyv::bytecheck::CheckBytes<
+                    rkyv::rancor::Strategy<
+                        rkyv::validation::Validator<
+                            rkyv::validation::archive::ArchiveValidator<'validation>,
+                            rkyv::validation::shared::SharedValidator,
+                        >,
+                        rkyv::rancor::Error,
+                    >,
+                >,
+        SnapshotMaterial<Root>: PortableArchive,
+        <SnapshotMaterial<Root> as rkyv::Archive>::Archived:
+            rkyv::Deserialize<
+                    SnapshotMaterial<Root>,
+                    rkyv::api::high::HighDeserializer<rkyv::rancor::Error>,
+                > + for<'validation> rkyv::bytecheck::CheckBytes<
+                    rkyv::rancor::Strategy<
+                        rkyv::validation::Validator<
+                            rkyv::validation::archive::ArchiveValidator<'validation>,
+                            rkyv::validation::shared::SharedValidator,
+                        >,
+                        rkyv::rancor::Error,
+                    >,
+                >,
+    {
+        let request_digest = self.request_digest(&request)?;
+        if let Some(existing) = self.receipts.get(&request.operation_key()) {
+            return match existing {
+                OperationReceipt::Seal(receipt) if receipt.request_digest == request_digest => Ok(
+                    StagedSeal::replay(self.revision, self.clone(), receipt.clone()),
+                ),
+                _ => Err(NameTableError::IdempotencyConflict {
+                    operation_key: request.operation_key(),
+                }),
+            };
+        }
 
-#[cfg(test)]
-mod archive_tests {
-    use content_identity::PortableArchive;
+        validate_request(&request)?;
+        let canonical = canonical_seal(&request);
+        let mut staged = self.clone();
+        let mut declarations = Vec::new();
 
-    use super::{Name, NameSlice, NameTable, NameTableArchiveEnvelope};
-    use crate::error::NameTableError;
-    use crate::identifier::IdentifierNamespace;
+        for root in request.roots() {
+            let address = TableAddress::root(root.root().clone());
+            staged.ensure_table(&address, root.mutability())?;
+            staged.apply_declarations(
+                &address,
+                &ModulePath::new(root.root().clone(), Vec::new()),
+                &canonical_declarations(root.declarations()),
+                &mut declarations,
+            )?;
+        }
 
-    #[test]
-    fn oversized_validated_metadata_is_rejected_before_name_deserialization() {
-        // This is deliberately only one namespace beyond its u16 range, not a
-        // million-name construction. `from_archive_bytes` reports the archived
-        // cardinality before rkyv can allocate a deserialized `Vec<Name>`.
-        let names = usize::from(u16::MAX) + 2;
-        let oversized = NameSlice {
-            namespace: IdentifierNamespace::Schema,
-            names: vec![Name::new("Repeated"); names],
+        let mut references = Vec::with_capacity(canonical.references.len());
+        for reference in &canonical.references {
+            let encoded_id = staged.resolve_reference(reference)?;
+            references.push(ResolvedName {
+                path: reference.path().clone(),
+                encoded_id,
+            });
+        }
+
+        let resulting_revision = staged
+            .revision
+            .next()
+            .ok_or(NameTableError::StateRevisionExhausted)?;
+        staged.revision = resulting_revision;
+        let receipt = SealReceipt {
+            operation_key: request.operation_key(),
+            request_digest,
+            declarations,
+            references,
+            resulting_revision,
         };
-        let payload = oversized
-            .to_archive_bytes()
-            .expect("archive oversized slice");
-        let bytes = NameTableArchiveEnvelope::current().seal(payload.as_ref());
-
-        assert!(matches!(
-            NameTable::from_archive_bytes(bytes.as_ref()),
-            Err(NameTableError::ArchivedNamespaceCapacity { names: archived_names })
-                if archived_names == names
-        ));
+        staged.receipts.insert(
+            request.operation_key(),
+            OperationReceipt::Seal(receipt.clone()),
+        );
+        staged.validate()?;
+        Ok(StagedSeal::new(self.revision, staged, receipt))
     }
+
+    /// Stage and commit one atomic nested seal.
+    pub fn seal(
+        &mut self,
+        request: SealRequest<Root>,
+    ) -> Result<SealReceipt<Root>, NameTableError<Root>>
+    where
+        CanonicalSeal<Root>: PortableArchive,
+        <CanonicalSeal<Root> as rkyv::Archive>::Archived:
+            rkyv::Deserialize<
+                    CanonicalSeal<Root>,
+                    rkyv::api::high::HighDeserializer<rkyv::rancor::Error>,
+                > + for<'validation> rkyv::bytecheck::CheckBytes<
+                    rkyv::rancor::Strategy<
+                        rkyv::validation::Validator<
+                            rkyv::validation::archive::ArchiveValidator<'validation>,
+                            rkyv::validation::shared::SharedValidator,
+                        >,
+                        rkyv::rancor::Error,
+                    >,
+                >,
+        SnapshotMaterial<Root>: PortableArchive,
+        <SnapshotMaterial<Root> as rkyv::Archive>::Archived:
+            rkyv::Deserialize<
+                    SnapshotMaterial<Root>,
+                    rkyv::api::high::HighDeserializer<rkyv::rancor::Error>,
+                > + for<'validation> rkyv::bytecheck::CheckBytes<
+                    rkyv::rancor::Strategy<
+                        rkyv::validation::Validator<
+                            rkyv::validation::archive::ArchiveValidator<'validation>,
+                            rkyv::validation::shared::SharedValidator,
+                        >,
+                        rkyv::rancor::Error,
+                    >,
+                >,
+    {
+        self.stage_seal(request)?.commit(self)
+    }
+
+    /// Purely stage one identity-preserving operational rename.
+    pub fn stage_rename(
+        &self,
+        request: RenameRequest<Root>,
+    ) -> Result<StagedRename<Root>, NameTableError<Root>>
+    where
+        SnapshotMaterial<Root>: PortableArchive,
+        <SnapshotMaterial<Root> as rkyv::Archive>::Archived:
+            rkyv::Deserialize<
+                    SnapshotMaterial<Root>,
+                    rkyv::api::high::HighDeserializer<rkyv::rancor::Error>,
+                > + for<'validation> rkyv::bytecheck::CheckBytes<
+                    rkyv::rancor::Strategy<
+                        rkyv::validation::Validator<
+                            rkyv::validation::archive::ArchiveValidator<'validation>,
+                            rkyv::validation::shared::SharedValidator,
+                        >,
+                        rkyv::rancor::Error,
+                    >,
+                >,
+    {
+        if let Some(existing) = self.receipts.get(&request.operation_key()) {
+            return match existing {
+                OperationReceipt::Rename(receipt)
+                    if receipt.target == *request.target()
+                        && receipt.new_spelling == *request.new_spelling() =>
+                {
+                    Ok(StagedRename::replay(
+                        self.revision,
+                        self.clone(),
+                        receipt.clone(),
+                    ))
+                }
+                _ => Err(NameTableError::IdempotencyConflict {
+                    operation_key: request.operation_key(),
+                }),
+            };
+        }
+
+        let mut staged = self.clone();
+        let address = request.target().owning_table();
+
+        // Mutability is intentionally checked before target entry lookup.
+        let head = staged
+            .heads
+            .get(&address)
+            .ok_or_else(|| NameTableError::UnknownTable {
+                address: address.clone(),
+            })?;
+        if head.mutability == TableMutability::Immutable {
+            return Err(NameTableError::ImmutableTable { address });
+        }
+
+        let current = staged.current_snapshot(&address)?.clone();
+        let local = request.target().local();
+        let old_spelling = current.resolve_local(local).cloned().ok_or_else(|| {
+            NameTableError::UnknownEncodedId {
+                encoded_id: request.target().clone(),
+            }
+        })?;
+        if let Some(existing) = current.lookup_local(request.new_spelling())
+            && existing != local
+        {
+            return Err(NameTableError::SpellingCollision {
+                address,
+                spelling: request.new_spelling().clone(),
+                existing,
+            });
+        }
+
+        let mut entries = current.entries.clone();
+        entries[usize::from(local.value())] = request.new_spelling().clone();
+        let generation =
+            current
+                .generation
+                .next()
+                .ok_or_else(|| NameTableError::TableGenerationExhausted {
+                    address: address.clone(),
+                })?;
+        let snapshot = staged.make_snapshot(&address, generation, entries)?;
+        let digest = snapshot.digest;
+        staged.snapshots.insert(digest, snapshot);
+        let head = staged
+            .heads
+            .get_mut(&address)
+            .expect("owning head was checked before entry lookup");
+        head.generation = generation;
+        head.current_snapshot = digest;
+
+        let resulting_revision = staged
+            .revision
+            .next()
+            .ok_or(NameTableError::StateRevisionExhausted)?;
+        staged.revision = resulting_revision;
+        let receipt = RenameReceipt {
+            operation_key: request.operation_key(),
+            target: request.target().clone(),
+            old_spelling,
+            new_spelling: request.new_spelling().clone(),
+            resulting_generation: generation,
+            resulting_revision,
+        };
+        staged.receipts.insert(
+            request.operation_key(),
+            OperationReceipt::Rename(receipt.clone()),
+        );
+        staged.validate()?;
+        Ok(StagedRename::new(self.revision, staged, receipt))
+    }
+
+    /// Stage and commit one identity-preserving operational rename.
+    pub fn rename(
+        &mut self,
+        request: RenameRequest<Root>,
+    ) -> Result<RenameReceipt<Root>, NameTableError<Root>>
+    where
+        SnapshotMaterial<Root>: PortableArchive,
+        <SnapshotMaterial<Root> as rkyv::Archive>::Archived:
+            rkyv::Deserialize<
+                    SnapshotMaterial<Root>,
+                    rkyv::api::high::HighDeserializer<rkyv::rancor::Error>,
+                > + for<'validation> rkyv::bytecheck::CheckBytes<
+                    rkyv::rancor::Strategy<
+                        rkyv::validation::Validator<
+                            rkyv::validation::archive::ArchiveValidator<'validation>,
+                            rkyv::validation::shared::SharedValidator,
+                        >,
+                        rkyv::rancor::Error,
+                    >,
+                >,
+    {
+        self.stage_rename(request)?.commit(self)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), NameTableError<Root>>
+    where
+        SnapshotMaterial<Root>: PortableArchive,
+        <SnapshotMaterial<Root> as rkyv::Archive>::Archived:
+            rkyv::Deserialize<
+                    SnapshotMaterial<Root>,
+                    rkyv::api::high::HighDeserializer<rkyv::rancor::Error>,
+                > + for<'validation> rkyv::bytecheck::CheckBytes<
+                    rkyv::rancor::Strategy<
+                        rkyv::validation::Validator<
+                            rkyv::validation::archive::ArchiveValidator<'validation>,
+                            rkyv::validation::shared::SharedValidator,
+                        >,
+                        rkyv::rancor::Error,
+                    >,
+                >,
+    {
+        for (digest, snapshot) in &self.snapshots {
+            if snapshot.entries.len() > usize::from(u16::MAX) + 1 {
+                return Err(NameTableError::SnapshotCapacity {
+                    address: snapshot.address.clone(),
+                });
+            }
+            let mut names = BTreeSet::new();
+            for spelling in &snapshot.entries {
+                if !names.insert(spelling) {
+                    return Err(NameTableError::DuplicateSnapshotSpelling {
+                        address: snapshot.address.clone(),
+                        spelling: spelling.clone(),
+                    });
+                }
+            }
+            let actual = typed_digest::<SnapshotIntegrityDomain, _>(
+                &SnapshotMaterial::from_snapshot(snapshot),
+            )
+            .map_err(NameTableError::Serialize)?;
+            if *digest != snapshot.digest || actual != snapshot.digest {
+                return Err(NameTableError::SnapshotIntegrityMismatch { digest: *digest });
+            }
+        }
+
+        for (address, head) in &self.heads {
+            let snapshot = self.snapshots.get(&head.current_snapshot).ok_or_else(|| {
+                NameTableError::InconsistentTableHead {
+                    address: address.clone(),
+                }
+            })?;
+            if head.address != *address
+                || snapshot.address != *address
+                || snapshot.generation != head.generation
+                || AllocationCursor::for_entry_count(snapshot.entries.len())
+                    != Some(head.allocation_cursor)
+            {
+                return Err(NameTableError::InconsistentTableHead {
+                    address: address.clone(),
+                });
+            }
+
+            if let Some((&local, parent_chain)) = address.module_chain().split_last() {
+                let parent =
+                    TableAddress::new(address.root_variant().clone(), parent_chain.to_vec());
+                let parent_snapshot = self.current_snapshot(&parent).map_err(|_| {
+                    NameTableError::InconsistentTableAncestry {
+                        address: address.clone(),
+                    }
+                })?;
+                if parent_snapshot.resolve_local(local).is_none() {
+                    return Err(NameTableError::InconsistentTableAncestry {
+                        address: address.clone(),
+                    });
+                }
+            }
+        }
+
+        for (operation_key, receipt) in &self.receipts {
+            match receipt {
+                OperationReceipt::Seal(receipt) => {
+                    if receipt.operation_key != *operation_key
+                        || receipt.resulting_revision > self.revision
+                    {
+                        return Err(NameTableError::InconsistentReceipt {
+                            operation_key: *operation_key,
+                        });
+                    }
+                    for resolved in receipt.declarations.iter().chain(receipt.references.iter()) {
+                        if resolved.encoded_id.chain().is_empty() {
+                            return Err(NameTableError::EmptyStoredEncodedId);
+                        }
+                        if self.resolve(&resolved.encoded_id).is_err() {
+                            return Err(NameTableError::InconsistentReceipt {
+                                operation_key: *operation_key,
+                            });
+                        }
+                    }
+                }
+                OperationReceipt::Rename(receipt) => {
+                    if receipt.operation_key != *operation_key
+                        || receipt.resulting_revision > self.revision
+                        || receipt.target.chain().is_empty()
+                    {
+                        return Err(NameTableError::InconsistentReceipt {
+                            operation_key: *operation_key,
+                        });
+                    }
+                    let address = receipt.target.owning_table();
+                    let Some(head) = self.heads.get(&address) else {
+                        return Err(NameTableError::InconsistentReceipt {
+                            operation_key: *operation_key,
+                        });
+                    };
+                    if receipt.resulting_generation > head.generation
+                        || self.resolve(&receipt.target).is_err()
+                    {
+                        return Err(NameTableError::InconsistentReceipt {
+                            operation_key: *operation_key,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_table(
+        &mut self,
+        address: &TableAddress<Root>,
+        mutability: TableMutability,
+    ) -> Result<(), NameTableError<Root>>
+    where
+        SnapshotMaterial<Root>: PortableArchive,
+        <SnapshotMaterial<Root> as rkyv::Archive>::Archived:
+            rkyv::Deserialize<
+                    SnapshotMaterial<Root>,
+                    rkyv::api::high::HighDeserializer<rkyv::rancor::Error>,
+                > + for<'validation> rkyv::bytecheck::CheckBytes<
+                    rkyv::rancor::Strategy<
+                        rkyv::validation::Validator<
+                            rkyv::validation::archive::ArchiveValidator<'validation>,
+                            rkyv::validation::shared::SharedValidator,
+                        >,
+                        rkyv::rancor::Error,
+                    >,
+                >,
+    {
+        if let Some(head) = self.heads.get(address) {
+            if head.mutability != mutability {
+                return Err(NameTableError::TableMutabilityMismatch {
+                    address: address.clone(),
+                    existing: head.mutability,
+                    submitted: mutability,
+                });
+            }
+            return Ok(());
+        }
+
+        let snapshot = self.make_snapshot(address, TableGeneration::ZERO, Vec::new())?;
+        let digest = snapshot.digest;
+        self.snapshots.insert(digest, snapshot);
+        self.heads.insert(
+            address.clone(),
+            ModuleTableHead {
+                address: address.clone(),
+                mutability,
+                generation: TableGeneration::ZERO,
+                allocation_cursor: AllocationCursor::ZERO,
+                current_snapshot: digest,
+            },
+        );
+        Ok(())
+    }
+
+    fn apply_declarations(
+        &mut self,
+        address: &TableAddress<Root>,
+        table_path: &ModulePath<Root>,
+        declarations: &[Declaration],
+        resolved: &mut Vec<ResolvedName<Root>>,
+    ) -> Result<(), NameTableError<Root>>
+    where
+        SnapshotMaterial<Root>: PortableArchive,
+        <SnapshotMaterial<Root> as rkyv::Archive>::Archived:
+            rkyv::Deserialize<
+                    SnapshotMaterial<Root>,
+                    rkyv::api::high::HighDeserializer<rkyv::rancor::Error>,
+                > + for<'validation> rkyv::bytecheck::CheckBytes<
+                    rkyv::rancor::Strategy<
+                        rkyv::validation::Validator<
+                            rkyv::validation::archive::ArchiveValidator<'validation>,
+                            rkyv::validation::shared::SharedValidator,
+                        >,
+                        rkyv::rancor::Error,
+                    >,
+                >,
+    {
+        let current = self.current_snapshot(address)?.clone();
+        let mut entries = current.entries.clone();
+        let mut cursor = self
+            .heads
+            .get(address)
+            .expect("current snapshot implies a head")
+            .allocation_cursor;
+        let mut ids = BTreeMap::new();
+
+        for declaration in declarations {
+            let spelling = declaration.name();
+            let local = if let Some(local) = current.lookup_local(spelling) {
+                local
+            } else if let Some((local, next)) = cursor.allocate() {
+                // A declaration spelling unseen in this module receives a new
+                // encoded ID. Changing authored text therefore creates a new
+                // identity and leaves the previous entry allocated. Only the
+                // rename operation preserves identity across a spelling change.
+                entries.push(spelling.clone());
+                cursor = next;
+                local
+            } else {
+                return Err(NameTableError::TableCapacity {
+                    address: address.clone(),
+                });
+            };
+            ids.insert(spelling.clone(), local);
+            resolved.push(ResolvedName {
+                path: NamePath::new(table_path.clone(), spelling.clone()),
+                encoded_id: address.entry(local),
+            });
+        }
+
+        if entries != current.entries {
+            let generation = current.generation.next().ok_or_else(|| {
+                NameTableError::TableGenerationExhausted {
+                    address: address.clone(),
+                }
+            })?;
+            let snapshot = self.make_snapshot(address, generation, entries)?;
+            let digest = snapshot.digest;
+            self.snapshots.insert(digest, snapshot);
+            let head = self
+                .heads
+                .get_mut(address)
+                .expect("current snapshot implies a head");
+            head.generation = generation;
+            head.allocation_cursor = cursor;
+            head.current_snapshot = digest;
+        }
+
+        for declaration in declarations {
+            if let Declaration::Module(module) = declaration {
+                let local = ids[module.name()];
+                let child_address = address.child(local);
+                self.ensure_table(&child_address, module.mutability())?;
+                let mut modules = table_path.modules().to_vec();
+                modules.push(module.name().clone());
+                self.apply_declarations(
+                    &child_address,
+                    &ModulePath::new(table_path.root().clone(), modules),
+                    module.declarations(),
+                    resolved,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_reference(
+        &self,
+        reference: &NameReference<Root>,
+    ) -> Result<EncodedId<Root>, NameTableError<Root>> {
+        let path = reference.path();
+        let mut address = TableAddress::root(path.table().root().clone());
+        for module in path.table().modules() {
+            let Some(module_id) = self.lookup(&address, module)? else {
+                return Err(NameTableError::UnresolvedReference {
+                    reference: reference.clone(),
+                });
+            };
+            address = module_id.child_table();
+            if !self.heads.contains_key(&address) {
+                return Err(NameTableError::UnresolvedReference {
+                    reference: reference.clone(),
+                });
+            }
+        }
+        self.lookup(&address, path.spelling())?
+            .ok_or_else(|| NameTableError::UnresolvedReference {
+                reference: reference.clone(),
+            })
+    }
+
+    fn make_snapshot(
+        &self,
+        address: &TableAddress<Root>,
+        generation: TableGeneration,
+        entries: Vec<Name>,
+    ) -> Result<ModuleTableSnapshot<Root>, NameTableError<Root>>
+    where
+        SnapshotMaterial<Root>: PortableArchive,
+        <SnapshotMaterial<Root> as rkyv::Archive>::Archived:
+            rkyv::Deserialize<
+                    SnapshotMaterial<Root>,
+                    rkyv::api::high::HighDeserializer<rkyv::rancor::Error>,
+                > + for<'validation> rkyv::bytecheck::CheckBytes<
+                    rkyv::rancor::Strategy<
+                        rkyv::validation::Validator<
+                            rkyv::validation::archive::ArchiveValidator<'validation>,
+                            rkyv::validation::shared::SharedValidator,
+                        >,
+                        rkyv::rancor::Error,
+                    >,
+                >,
+    {
+        let digest = typed_digest::<SnapshotIntegrityDomain, _>(&SnapshotMaterial::new(
+            address, generation, &entries,
+        ))
+        .map_err(NameTableError::Serialize)?;
+        Ok(ModuleTableSnapshot {
+            address: address.clone(),
+            generation,
+            entries,
+            digest,
+        })
+    }
+}
+
+fn canonical_seal<Root: Clone + Ord>(request: &SealRequest<Root>) -> CanonicalSeal<Root> {
+    let mut roots = request
+        .roots()
+        .iter()
+        .map(|root| CanonicalRoot {
+            root: root.root().clone(),
+            mutability: root.mutability(),
+        })
+        .collect::<Vec<_>>();
+    roots.sort();
+
+    let mut declarations = Vec::new();
+    for root in request.roots() {
+        flatten_declarations(root.root(), &[], root.declarations(), &mut declarations);
+    }
+    declarations.sort();
+
+    let mut references = request.references().to_vec();
+    references.sort();
+    CanonicalSeal {
+        roots,
+        declarations,
+        references,
+    }
+}
+
+fn flatten_declarations<Root: Clone>(
+    root: &Root,
+    table_path: &[Name],
+    declarations: &[Declaration],
+    flattened: &mut Vec<CanonicalDeclaration<Root>>,
+) {
+    for declaration in declarations {
+        let child_mutability = match declaration {
+            Declaration::Member(_) => None,
+            Declaration::Module(module) => Some(module.mutability()),
+        };
+        flattened.push(CanonicalDeclaration {
+            root: root.clone(),
+            table_path: table_path.to_vec(),
+            spelling: declaration.name().clone(),
+            child_mutability,
+        });
+        if let Declaration::Module(module) = declaration {
+            let mut child_path = table_path.to_vec();
+            child_path.push(module.name().clone());
+            flatten_declarations(root, &child_path, module.declarations(), flattened);
+        }
+    }
+}
+
+fn canonical_declarations(declarations: &[Declaration]) -> Vec<Declaration> {
+    let mut canonical = declarations
+        .iter()
+        .map(|declaration| match declaration {
+            Declaration::Member(name) => Declaration::Member(name.clone()),
+            Declaration::Module(module) => Declaration::Module(ModuleDeclaration::new(
+                module.name().clone(),
+                module.mutability(),
+                canonical_declarations(module.declarations()),
+            )),
+        })
+        .collect::<Vec<_>>();
+    canonical.sort_by(|left, right| left.name().as_bytes().cmp(right.name().as_bytes()));
+    canonical
+}
+
+fn validate_request<Root: Clone + Ord>(
+    request: &SealRequest<Root>,
+) -> Result<(), NameTableError<Root>> {
+    let mut roots = BTreeSet::new();
+    for root in request.roots() {
+        if !roots.insert(root.root()) {
+            return Err(NameTableError::DuplicateRootDeclaration {
+                root: root.root().clone(),
+            });
+        }
+        validate_declarations(
+            &ModulePath::new(root.root().clone(), Vec::new()),
+            root.declarations(),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_declarations<Root: Clone + Ord>(
+    table_path: &ModulePath<Root>,
+    declarations: &[Declaration],
+) -> Result<(), NameTableError<Root>> {
+    let mut spellings = BTreeSet::new();
+    for declaration in declarations {
+        if !spellings.insert(declaration.name()) {
+            return Err(NameTableError::Redefinition {
+                table: table_path.clone(),
+                spelling: declaration.name().clone(),
+            });
+        }
+        if let Declaration::Module(module) = declaration {
+            let mut modules = table_path.modules().to_vec();
+            modules.push(module.name().clone());
+            validate_declarations(
+                &ModulePath::new(table_path.root().clone(), modules),
+                module.declarations(),
+            )?;
+        }
+    }
+    Ok(())
 }

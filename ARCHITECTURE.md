@@ -3,30 +3,13 @@
 ## Status boundary
 
 `name-table` is the string/encodedID correspondence library in the shared
-language substrate. Its current published implementation and its approved
-replacement model are different. This document names both so current APIs are
-not mistaken for the design being built.
+language substrate. Version 0.2 implements the generic nested-table foundation.
+Consumers pinned to earlier published revisions still see the legacy flat
+component-slice API until the coordinated breaking train repins them.
 
-The current implementation is a legacy flat model:
+## Nested identity
 
-- `IdentifierNamespace` is a closed enum whose variants carry local `u16`
-  indices.
-- One `NameTable` owns one flat `NameSlice` and may borrow completed slices from
-  other component namespaces.
-- `Identifier` values are a namespace variant plus one local index, not a
-  module chain.
-- `NameInterner` permits allocation along codec paths.
-- Composition creates one cross-slice spelling index and can fail with
-  `NameIndexCollision`.
-- `Name` contains eager casing and derived-name walkers.
-
-Those facts describe the code that is wired today. They are not the target
-identity model. Consumers remain pinned to this legacy API until a coordinated
-breaking train replaces it.
-
-## Approved target
-
-The replacement is generic over a root-table variant type whose production
+The implementation is generic over a root-table variant type whose production
 variants remain a separate design question. Under one variant, every module
 owns the exact spelling table of its immediate members. A module is itself an
 entry in its containing module's table.
@@ -95,10 +78,10 @@ order and gives the same declaration set the same request digest. Allocation is
 module-scoped: capacity exhaustion in one table never spills into another table,
 silently widens the identifier, or reuses an old local encodedID.
 
-The library provides generic state and transaction mechanisms. The translator
-daemon is the sole persistent writer and owns authentication, authorization,
-idempotent sealing, durable recovery, notifications, and its embedded sema
-database.
+The library provides generic state, staging, versioned archive, snapshot
+integrity, and idempotent receipt mechanisms. The eventual translator daemon is
+the sole persistent writer and owns authentication, authorization, durable
+recovery, notifications, and its embedded sema database.
 
 ## Rename
 
@@ -133,17 +116,17 @@ treated as the target projection mechanism.
 
 ## Current code map
 
-The files below belong to the legacy implementation that consumers currently
-pin:
-
-- `src/identifier.rs` — closed `IdentifierNamespace` and flat `Identifier`.
-- `src/table.rs` — flat home and borrowed slices, composition, archive, and
-  derived global spelling index.
-- `src/transaction.rs` — speculative flat-table interning.
-- `src/boundary.rs` — decoder-facing `NameResolver` and `NameInterner`.
-- `src/name.rs` — exact names plus eager derived-spelling walkers.
-- `src/projection.rs` — the existing textual-projection surface.
-- `src/error.rs` — legacy typed errors, including `NameIndexCollision`.
-
-The replacement archive and wire format must reject the flat archive explicitly;
-a flat component slice cannot be guessed into nested encodedID chains.
+- `src/identity.rs` — `LocalEncodedId`, generic zero-or-more
+  `TableAddress`, and non-empty `EncodedId`.
+- `src/request.rs` — typed nested declarations, lookup-only references, and
+  operational rename input.
+- `src/state.rs` — table heads, immutable snapshots, cursors, typed integrity
+  digests, and durable receipts.
+- `src/table.rs` — module-scoped lookup, canonical seal application, rename,
+  and stored-state validation.
+- `src/transaction.rs` — pure staged seal and rename values with stale-base
+  commit refusal and effect-free rollback.
+- `src/archive.rs` — archive layout 2 and explicit rejection of the flat
+  archive.
+- `src/name.rs` — exact spelling only; no eager casing or derivation.
+- `src/error.rs` — typed no-write failures.

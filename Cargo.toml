@@ -13,7 +13,7 @@ name = "name_table"
 path = "src/lib.rs"
 
 [dependencies]
-content-identity = { git = "https://github.com/LiGoldragon/content-identity.git", rev = "fdf2db1d5a9e8ea52d24d39a03833c3e6885c355" }
+content-identity = { git = "https://github.com/LiGoldragon/content-identity.git", rev = "b854609968b9ffe349f23b2afcaef15574b0a86e" }
 rkyv             = { version = "0.8", default-features = false, features = ["std", "bytecheck", "little_endian", "pointer_width_32", "unaligned"] }
 thiserror        = "2"
 

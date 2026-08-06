@@ -1,11 +1,11 @@
 [package]
 name         = "name-table"
-version      = "0.3.0"
+version      = "0.4.0"
 edition      = "2024"
 rust-version = "1.85"
 license      = "MIT OR Apache-2.0"
 repository   = "https://github.com/LiGoldragon/name-table"
-description  = "Generic nested module-owned name tables with durable encoded-ID chains and atomic staging."
+description  = "Random encoded-name to true-name association authority with exact replay."
 publish      = false
 
 [lib]
@@ -13,7 +13,7 @@ name = "name_table"
 path = "src/lib.rs"
 
 [dependencies]
-content-identity = { git = "https://github.com/LiGoldragon/content-identity.git", rev = "896b21e17f31b66d0802bff899b4b60acea9c0f1" }
+content-identity = { git = "https://github.com/LiGoldragon/content-identity.git", rev = "df1d25c7cd9e822ae03255e04ede59a00b78480b" }
 rkyv             = { version = "0.8", default-features = false, features = ["std", "bytecheck", "little_endian", "pointer_width_32", "unaligned"] }
 thiserror        = "2"
 

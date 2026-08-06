@@ -5,9 +5,14 @@
 //! reference data; an authority must mint it from a CSPRNG and must never accept
 //! caller-selected bytes for a create operation.
 
-use std::collections::BTreeSet;
-
-use content_identity::ContentAddressedHash;
+use content_identity::{ArchiveError, ContentAddressedHash, PortableArchive};
+use rkyv::Deserialize as RkyvDeserialize;
+use rkyv::api::high::HighDeserializer;
+use rkyv::bytecheck::CheckBytes;
+use rkyv::rancor::{self, Strategy};
+use rkyv::validation::Validator;
+use rkyv::validation::archive::ArchiveValidator;
+use rkyv::validation::shared::SharedValidator;
 
 /// An opaque 128-bit encoded reference.
 #[derive(
@@ -63,6 +68,27 @@ impl TrueName {
     /// The opaque content identity for archive and comparison use.
     pub const fn content_addressed_hash(self) -> ContentAddressedHash {
         self.0
+    }
+}
+
+/// An encoded value with a deterministic true name.
+///
+/// The default uses precisely the existing portable rkyv wire capability. A
+/// strict, name-free body type opts into this trait only after its owner has
+/// established that its own `TextualName` is absent and all references are
+/// `EncodedName` values.
+pub trait TrueNamed: PortableArchive
+where
+    Self::Archived: RkyvDeserialize<Self, HighDeserializer<rancor::Error>>
+        + for<'validation> CheckBytes<
+            Strategy<Validator<ArchiveValidator<'validation>, SharedValidator>, rancor::Error>,
+        >,
+{
+    /// Hash the canonical portable wire bytes of this strict encoded value.
+    fn true_name(&self) -> Result<TrueName, ArchiveError> {
+        Ok(TrueName::from_content_addressed_hash(
+            ContentAddressedHash::derive(self.to_archive_bytes()?.as_ref()),
+        ))
     }
 }
 
@@ -136,9 +162,9 @@ impl OperationKey {
     rkyv::Deserialize,
     rkyv::Serialize,
 )]
-pub struct VisibleName(String);
+pub struct TextualName(String);
 
-impl VisibleName {
+impl TextualName {
     /// Record an exact spelling without normalization.
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
@@ -215,7 +241,7 @@ impl FilePlacement {
     rkyv::Serialize,
 )]
 pub struct TextualMetadata {
-    visible_name: VisibleName,
+    textual_name: TextualName,
     module_placement: ModulePlacement,
     file_placement: FilePlacement,
 }
@@ -223,19 +249,19 @@ pub struct TextualMetadata {
 impl TextualMetadata {
     /// Construct structured textual metadata.
     pub const fn new(
-        visible_name: VisibleName,
+        textual_name: TextualName,
         module_placement: ModulePlacement,
         file_placement: FilePlacement,
     ) -> Self {
         Self {
-            visible_name,
+            textual_name,
             module_placement,
             file_placement,
         }
     }
-    /// Visible spelling.
-    pub const fn visible_name(&self) -> &VisibleName {
-        &self.visible_name
+    /// Textual spelling.
+    pub const fn textual_name(&self) -> &TextualName {
+        &self.textual_name
     }
     /// Module placement.
     pub const fn module_placement(&self) -> &ModulePlacement {
@@ -418,8 +444,6 @@ impl NameChangeReceipt {
 pub trait NameView {
     /// Association including tombstones.
     fn association(&self, encoded_name: &EncodedName) -> Option<&NameAssociation>;
-    /// Every live encoded name sharing one true name.
-    fn encoded_names(&self, true_name: &TrueName) -> Option<&BTreeSet<EncodedName>>;
     /// Textual metadata for a live name.
     fn textual_metadata(&self, encoded_name: &EncodedName) -> Option<&TextualMetadata>;
 }
@@ -478,4 +502,38 @@ pub trait NameChangeReplay {
 pub enum NameTableError {
     #[error("content revision overflowed")]
     ContentRevisionExhausted,
+}
+
+#[cfg(test)]
+mod tests {
+    use content_identity::{ContentAddressedHash, PortableArchive};
+
+    use super::{EncodedName, TrueName, TrueNamed};
+
+    #[derive(Clone, rkyv::Archive, rkyv::Deserialize, rkyv::Serialize)]
+    struct StrictBody {
+        referenced_name: EncodedName,
+        payload: u16,
+    }
+
+    impl TrueNamed for StrictBody {}
+
+    #[test]
+    fn strict_body_true_name_is_its_portable_wire_hash() {
+        let body = StrictBody {
+            referenced_name: EncodedName::from_archive_bytes([7; 16]),
+            payload: 42,
+        };
+
+        let expected = TrueName::from_content_addressed_hash(ContentAddressedHash::derive(
+            body.to_archive_bytes()
+                .expect("strict test body archives")
+                .as_ref(),
+        ));
+
+        assert_eq!(
+            body.true_name().expect("strict body has a true name"),
+            expected
+        );
+    }
 }

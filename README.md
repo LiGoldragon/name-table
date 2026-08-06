@@ -1,11 +1,12 @@
 # name-table
 
-`name-table` is the durable association authority for randomly issued opaque
-`EncodedName` values. A `TrueName` is derived by the body owner from verified
-canonical content; the table records one-to-many `{EncodedName TrueName}`
-associations, content revisions, tombstones, and separate typed textual
-metadata.
+`name-table` defines pure association facts and capability contracts for
+authority-issued opaque `EncodedName` values. A `TrueName` is derived by a
+strict encoded body through the `TrueNamed` capability's `PortableArchive`
+default. The facts describe associations, content revisions, tombstones, and
+separate typed `TextualName` metadata.
 
-Every mutation appends its realized fact to the change log. Create stores the
-random issued bytes, so replay reconstructs state without regenerating random
-values or deriving content identities.
+Operational allocation, durable state, staging, commit, and replay belong to
+the Sema authority, not this contract crate. Its create operation mints random
+encoded bytes and records the realized fact, so replay never regenerates random
+values or derives content identities.
